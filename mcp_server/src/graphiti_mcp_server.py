@@ -39,6 +39,8 @@ from models.response_types import (
     SuccessResponse,
     TripletResponse,
 )
+from services.circuit_breaker import CircuitOpenError, QueueCapacityExceeded
+from services.episode_spool import EpisodeRetryer
 from services.factories import (
     CrossEncoderFactory,
     DatabaseDriverFactory,
@@ -172,6 +174,13 @@ entity types via an edge_type_map. With no such configuration, default extractio
 When adding information, provide descriptive names and detailed content to improve search quality.
 When searching, use specific queries and consider filtering by group_id, type, or date range. The
 server requires a configured database and valid API keys for language-model operations.
+
+Backpressure: add_memory is processed asynchronously through a resilient write path. If the LLM
+provider API is under load (rate limits, 5xx, timeouts) the server returns an error whose text
+starts with "graphiti_backpressure:". This means the episode was NOT queued and NOT lost; it was
+rejected up front so nothing is silently dropped. Search, facts and get_status keep working
+normally in this state. Retry add_memory after the retry_after_seconds interval reported in the
+error and, on the retry, let the user know the service is currently degraded.
 """
 
 # MCP server instance
@@ -183,6 +192,7 @@ mcp = MCPServer(
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None
+episode_retryer: EpisodeRetryer | None = None
 
 
 _group_drivers: dict[tuple[int, str], GraphDriver] = {}
@@ -399,6 +409,28 @@ class GraphitiService:
         return self.client
 
 
+async def _backpressure_error_response(exc: Exception) -> ErrorResponse:
+    """Build a machine-readable ErrorResponse for a fail-fast backpressure rejection."""
+    snapshot: dict[str, Any] = {}
+    if queue_service is not None:
+        try:
+            snapshot = await queue_service.get_resilience_snapshot()
+        except Exception:
+            snapshot = {}
+    state = snapshot.get('state', getattr(exc, 'state', 'unknown'))
+    depth = snapshot.get('queue_depth', '?')
+    max_depth = snapshot.get('max_queue_depth', 20)
+    retry_after = snapshot.get('retry_after_seconds') or config.resilience.open_timeout_seconds
+    message = (
+        f'graphiti_backpressure: circuit_state={state} '
+        f'queue_depth={depth}/{max_depth} '
+        f'retry_after_seconds={retry_after}. Episode NOT queued. '
+        f'Actions: search works; retry add_memory after ~{retry_after}s.'
+    )
+    logger.warning('add_memory rejected by backpressure: %s', message)
+    return ErrorResponse(error=message)
+
+
 @mcp.tool()
 async def add_memory(
     name: str,
@@ -529,6 +561,10 @@ async def add_memory(
         return SuccessResponse(
             message=f"Episode '{name}' queued for processing in group '{effective_group_id}'"
         )
+    except (CircuitOpenError, QueueCapacityExceeded) as e:
+        # Fail-fast backpressure: the episode was NOT queued and NOT lost. Return a
+        # machine-readable error so the caller can retry after the cooldown.
+        return _backpressure_error_response(e)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
@@ -1178,12 +1214,27 @@ async def get_status() -> StatusResponse:
 @mcp.custom_route('/health', methods=['GET'])
 async def health_check(request) -> JSONResponse:
     """Health check endpoint for Docker and load balancers."""
-    return JSONResponse({'status': 'healthy', 'service': 'graphiti-mcp'})
+    body: dict[str, Any] = {'status': 'healthy', 'service': 'graphiti-mcp'}
+
+    if queue_service is not None:
+        try:
+            snapshot = await queue_service.get_resilience_snapshot()
+        except Exception as e:
+            snapshot = {'state': 'error', 'detail': str(e)}
+        body['circuit_breaker'] = snapshot.get('state', 'unknown')
+        body['queue_depth'] = snapshot.get('queue_depth', 0)
+        body['max_queue_depth'] = snapshot.get('max_queue_depth', 20)
+        body['pending_episodes'] = snapshot.get('pending_episodes', 0)
+        body['retry_after_seconds'] = snapshot.get('retry_after_seconds', 0)
+        if snapshot.get('state') in ('open', 'half_open'):
+            body['status'] = 'degraded'
+
+    return JSONResponse(body)
 
 
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
-    global config, graphiti_service, queue_service, graphiti_client, semaphore
+    global config, graphiti_service, queue_service, episode_retryer, graphiti_client, semaphore
 
     parser = argparse.ArgumentParser(
         description='Run the Graphiti MCP server with YAML configuration support'
@@ -1307,7 +1358,7 @@ async def initialize_server() -> ServerConfig:
 
     # Initialize services
     graphiti_service = GraphitiService(config, SEMAPHORE_LIMIT)
-    queue_service = QueueService()
+    queue_service = QueueService(config.resilience)
     await graphiti_service.initialize()
 
     # Set global client for backward compatibility
@@ -1317,6 +1368,59 @@ async def initialize_server() -> ServerConfig:
     # Initialize queue service with the client
     await queue_service.initialize(graphiti_client)
 
+    # Start the spool retryer if resilience is enabled.
+    if config.resilience.enabled and config.resilience.spool_enabled and queue_service.spool is not None:
+        resilience = config.resilience
+
+        def episode_builder(plan: dict[str, Any]) -> dict[str, Any]:
+            """Rebuild graphiti.add_episode kwargs from a persisted spool plan.
+
+            Complex structures (entity_types/edge_types/edge_type_map and the
+            EpisodeType enum) are not persisted; they are rebuilt from the live
+            service, mirroring what add_memory passes at queued time.
+            """
+            ref = parse_reference_time(plan.get('reference_time'))
+            return {
+                'name': plan['name'],
+                'episode_body': plan['episode_body'],
+                'source_description': plan['source_description'],
+                'source': EpisodeType[plan['source']],
+                'group_id': plan['group_id'],
+                'reference_time': ref or datetime.now(timezone.utc),
+                'entity_types': graphiti_service.entity_types,
+                'edge_types': graphiti_service.edge_types,
+                'edge_type_map': graphiti_service.edge_type_map,
+                'excluded_entity_types': plan.get('excluded_entity_types'),
+                'previous_episode_uuids': plan.get('previous_episode_uuids'),
+                'custom_extraction_instructions': plan.get('custom_extraction_instructions'),
+                'update_communities': plan.get('update_communities', False),
+                'saga': plan.get('saga'),
+                'saga_previous_episode_uuid': plan.get('saga_previous_episode_uuid'),
+                'uuid': plan.get('uuid'),
+            }
+
+        episode_retryer = EpisodeRetryer(
+            spool=queue_service.spool,
+            breaker=queue_service.circuit_breaker,
+            episode_builder=episode_builder,
+            graphiti_client=graphiti_client,
+            interval_seconds=resilience.retryer_interval_seconds,
+            max_attempts=resilience.max_spool_attempts,
+            backoff_base_seconds=resilience.spool_backoff_base_seconds,
+        )
+        episode_retryer.start()
+        logger.info(
+            'Episode retryer armed (spool=%s, interval=%ss, max_attempts=%d)',
+            queue_service.spool.root,
+            resilience.retryer_interval_seconds,
+            resilience.max_spool_attempts,
+        )
+
+    # Set MCP server settings
+    if config.server.host:
+        mcp.settings.host = config.server.host
+    if config.server.port:
+        mcp.settings.port = config.server.port
     # Return MCP configuration for transport
     return config.server
 

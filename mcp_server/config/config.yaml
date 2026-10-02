@@ -135,3 +135,19 @@ graphiti:
   #   - source: "Entity"
   #     target: "Location"
   #     edge_types: ["LocatedAt"]
+
+# Optional resilience for the episode write path. All values below are the
+# defaults; the section can be omitted entirely. When enabled, a circuit
+# breaker rejects new add_memory calls during LLM rate-limit/5xx waves (returning
+# a "graphiti_backpressure:" error) and failed episodes are spooled to disk and
+# replayed by a background retryer, surviving restarts.
+# resilience:
+#   enabled: true
+#   max_queue_depth: 20
+#   failure_threshold: 3
+#   open_timeout_seconds: 30
+#   spool_enabled: true
+#   spool_dir: "~/.graphiti/spool"
+#   retryer_interval_seconds: 15
+#   spool_backoff_base_seconds: 30
+#   max_spool_attempts: 10
