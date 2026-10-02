@@ -147,7 +147,7 @@ graphiti:
 #   failure_threshold: 3
 #   open_timeout_seconds: 30
 #   spool_enabled: true
-#   spool_dir: "~/.graphiti/spool"
+#   spool_dir: "~/.graphiti/spool"   # created on start; contains private episode content - keep ignored
 #   retryer_interval_seconds: 15
 #   spool_backoff_base_seconds: 30
 #   max_spool_attempts: 10

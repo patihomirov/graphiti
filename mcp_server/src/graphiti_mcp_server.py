@@ -181,6 +181,8 @@ starts with "graphiti_backpressure:". This means the episode was NOT queued and 
 rejected up front so nothing is silently dropped. Search, facts and get_status keep working
 normally in this state. Retry add_memory after the retry_after_seconds interval reported in the
 error and, on the retry, let the user know the service is currently degraded.
+Failed episodes that were already accepted are spooled to disk and replayed automatically; these
+replays are idempotent for episodes that carry a uuid, so re-triggering the same episode is safe.
 """
 
 # MCP server instance

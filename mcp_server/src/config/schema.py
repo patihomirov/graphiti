@@ -290,7 +290,10 @@ class ResilienceConfig(BaseModel):
         default=30.0, description='Cooldown before the breaker tries a half-open probe'
     )
     spool_enabled: bool = Field(default=True, description='Enable disk spooling of failed episodes')
-    spool_dir: str = Field(default='~/.graphiti/spool', description='Directory for the episode spool')
+    spool_dir: str = Field(
+        default='~/.graphiti/spool',
+        description='Directory for the episode spool (created on service start when spooling is enabled)',
+    )
     retryer_interval_seconds: float = Field(
         default=15.0, description='Interval between spool scan ticks'
     )

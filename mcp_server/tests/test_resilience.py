@@ -7,6 +7,8 @@ a real database.
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from unittest.mock import AsyncMock
 
 import httpx
@@ -106,6 +108,64 @@ class TestCircuitBreaker:
         await breaker.record_failure(RateLimitError())  # probe fails
         assert (await breaker.get_snapshot())['state'] == 'open'
         assert await breaker.allow_request() is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_half_open_allows_only_single_probe(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, open_timeout_seconds=30.0, time_fn=clock)
+        await breaker.record_failure(RateLimitError())
+        clock.advance(30.0)
+
+        # First allow flips open -> half_open and reserves the single probe.
+        assert await breaker.allow_request() is True
+        assert (await breaker.get_snapshot())['state'] == 'half_open'
+
+        # While that probe is in flight, any parallel submission is rejected.
+        results = await asyncio.gather(*[breaker.allow_request() for _ in range(5)])
+        assert all(r is False for r in results)
+
+        # Probe resolves successfully -> closed, and submissions are allowed again.
+        await breaker.record_success()
+        assert (await breaker.get_snapshot())['state'] == 'closed'
+        assert await breaker.allow_request() is True
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_retry_after_read_from_cause_chain(self):
+        """Retry-After on a wrapped httpx.HTTPStatusError surfaces into the snapshot."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, open_timeout_seconds=30.0, time_fn=clock)
+
+        request = httpx.Request('GET', 'http://x')
+        response = httpx.Response(429, request=request, headers={'Retry-After': '45'})
+        cause = httpx.HTTPStatusError('rate limited', request=request, response=response)
+        exc = RateLimitError('limit')
+        exc.__cause__ = cause  # simulate `raise RateLimitError(...) from httpx_err`
+
+        await breaker.record_failure(exc)
+        snapshot = await breaker.get_snapshot()
+        assert snapshot['state'] == 'open'
+        # max(open_timeout=30, retry_after=45) with no elapsed time -> 45.
+        assert snapshot['retry_after_seconds'] == pytest.approx(45.0)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_retry_after_supports_http_date_form(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, open_timeout_seconds=30.0, time_fn=clock)
+
+        request = httpx.Request('GET', 'http://x')
+        future = datetime.now(timezone.utc) + timedelta(seconds=120)
+        response = httpx.Response(429, request=request, headers={'Retry-After': format_datetime(future)})
+        cause = httpx.HTTPStatusError('rate limited', request=request, response=response)
+        exc = RateLimitError('limit')
+        exc.__cause__ = cause
+
+        await breaker.record_failure(exc)
+        snapshot = await breaker.get_snapshot()
+        assert snapshot['state'] == 'open'
+        assert snapshot['retry_after_seconds'] == pytest.approx(120.0, abs=10.0)
 
 
 class TestIsTransientError:

@@ -7,6 +7,11 @@ A background retryer later replays these files, rebuilding the complex entities
 (``entity_types``/``edge_types``/``edge_type_map`` and the ``EpisodeType`` enum)
 from the live service at retry time. Because everything is on disk, episodes
 survive process restarts and are never lost silently.
+
+Idempotency note: a replay is only guaranteed idempotent when the episode has an
+explicit ``uuid`` (graphiti-core upserts on that uuid). An episode spooled without
+a uuid will be re-ingested as a new node on each replay, so callers should prefer
+to pass a ``uuid`` to add_memory when they need dedup safety across retries.
 """
 
 import asyncio

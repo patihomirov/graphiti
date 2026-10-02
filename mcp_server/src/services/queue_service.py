@@ -113,8 +113,11 @@ class QueueService:
                 await self._episode_queues[group_id].put((process_func, plan))
                 self._queue_depth += 1
 
-                # Start a worker for this queue if one isn't already running
+                # Start a worker for this queue if one isn't already running.
+                # Claim the worker slot *before* scheduling so concurrent submits
+                # cannot spawn duplicate workers for the same group_id.
                 if not self._queue_workers.get(group_id, False):
+                    self._queue_workers[group_id] = True
                     asyncio.create_task(self._process_episode_queue(group_id))
 
                 return self._episode_queues[group_id].qsize()
@@ -125,7 +128,9 @@ class QueueService:
 
         await self._episode_queues[group_id].put((process_func, plan))
 
+        # Claim the worker slot before scheduling (same reasoning as above).
         if not self._queue_workers.get(group_id, False):
+            self._queue_workers[group_id] = True
             asyncio.create_task(self._process_episode_queue(group_id))
 
         return self._episode_queues[group_id].qsize()
