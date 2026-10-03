@@ -566,7 +566,7 @@ async def add_memory(
     except (CircuitOpenError, QueueCapacityExceeded) as e:
         # Fail-fast backpressure: the episode was NOT queued and NOT lost. Return a
         # machine-readable error so the caller can retry after the cooldown.
-        return _backpressure_error_response(e)
+        return await _backpressure_error_response(e)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
