@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -152,6 +152,14 @@ class LLMConfig(BaseModel):
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )
     max_tokens: int = Field(default=4096, description='Max tokens')
+    structured_output_mode: Literal['json_schema', 'json_object'] = Field(
+        default='json_schema',
+        description=(
+            'Structured output mode for OpenAIGenericClient: json_schema requests native '
+            'schema enforcement; json_object injects the schema into the prompt for '
+            'OpenAI-compatible providers that do not reliably honor json_schema.'
+        ),
+    )
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
 
@@ -187,6 +195,7 @@ class FalkorDBProviderConfig(BaseModel):
     """FalkorDB provider configuration."""
 
     uri: str = 'redis://localhost:6379'
+    username: str | None = None
     password: str | None = None
     database: str = 'default_db'
 
@@ -262,6 +271,40 @@ class GraphitiAppConfig(BaseModel):
             self.episode_id_prefix = ''
 
 
+class ResilienceConfig(BaseModel):
+    """Resilience configuration for the episode write path.
+
+    Provides fail-fast backpressure via a circuit breaker and durable on-disk
+    spooling of episodes that fail to ingest, so writes survive 429 waves and
+    process restarts instead of being silently lost.
+    """
+
+    enabled: bool = Field(default=True, description='Enable resilience (breaker + spool)')
+    max_queue_depth: int = Field(
+        default=20, description='Max total queued episodes across all group_ids before fail-fast'
+    )
+    failure_threshold: int = Field(
+        default=3, description='Consecutive transient failures to trip the breaker open'
+    )
+    open_timeout_seconds: float = Field(
+        default=30.0, description='Cooldown before the breaker tries a half-open probe'
+    )
+    spool_enabled: bool = Field(default=True, description='Enable disk spooling of failed episodes')
+    spool_dir: str = Field(
+        default='~/.graphiti/spool',
+        description='Directory for the episode spool (created on service start when spooling is enabled)',
+    )
+    retryer_interval_seconds: float = Field(
+        default=15.0, description='Interval between spool scan ticks'
+    )
+    spool_backoff_base_seconds: float = Field(
+        default=30.0, description='Base (in seconds) for exponential retry backoff'
+    )
+    max_spool_attempts: int = Field(
+        default=10, description='Max retry attempts before an episode is moved to failed/'
+    )
+
+
 class GraphitiConfig(BaseSettings):
     """Graphiti configuration with YAML and environment support."""
 
@@ -270,6 +313,7 @@ class GraphitiConfig(BaseSettings):
     embedder: EmbedderConfig = Field(default_factory=EmbedderConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     graphiti: GraphitiAppConfig = Field(default_factory=GraphitiAppConfig)
+    resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
 
     # Additional server options
     destroy_graph: bool = Field(default=False, description='Clear graph on startup')

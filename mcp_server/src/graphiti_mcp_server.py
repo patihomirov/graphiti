@@ -5,6 +5,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import copy
 import logging
 import os
 import sys
@@ -15,11 +16,12 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
+from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
@@ -37,7 +39,14 @@ from models.response_types import (
     SuccessResponse,
     TripletResponse,
 )
-from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+from services.circuit_breaker import CircuitOpenError, QueueCapacityExceeded
+from services.episode_spool import EpisodeRetryer
+from services.factories import (
+    CrossEncoderFactory,
+    DatabaseDriverFactory,
+    EmbedderFactory,
+    LLMClientFactory,
+)
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result, to_edge_result, to_node_result
 from utils.type_config import (
@@ -165,10 +174,19 @@ entity types via an edge_type_map. With no such configuration, default extractio
 When adding information, provide descriptive names and detailed content to improve search quality.
 When searching, use specific queries and consider filtering by group_id, type, or date range. The
 server requires a configured database and valid API keys for language-model operations.
+
+Backpressure: add_memory is processed asynchronously through a resilient write path. If the LLM
+provider API is under load (rate limits, 5xx, timeouts) the server returns an error whose text
+starts with "graphiti_backpressure:". This means the episode was NOT queued and NOT lost; it was
+rejected up front so nothing is silently dropped. Search, facts and get_status keep working
+normally in this state. Retry add_memory after the retry_after_seconds interval reported in the
+error and, on the retry, let the user know the service is currently degraded.
+Failed episodes that were already accepted are spooled to disk and replayed automatically; these
+replays are idempotent for episodes that carry a uuid, so re-triggering the same episode is safe.
 """
 
 # MCP server instance
-mcp = FastMCP(
+mcp = MCPServer(
     'Graphiti Agent Memory',
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
 )
@@ -176,6 +194,42 @@ mcp = FastMCP(
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None
+episode_retryer: EpisodeRetryer | None = None
+
+
+_group_drivers: dict[tuple[int, str], GraphDriver] = {}
+
+
+def _driver_for_group(client: Graphiti, group_id: str) -> GraphDriver:
+    """Return a driver bound to the graph that stores the given group.
+
+    FalkorDB stores each non-default group_id in its own graph; on backends
+    where clone() is a no-op this returns the base driver unchanged. Clones are
+    cached per base driver and group so the backend builds indices once per group.
+    """
+    key = (id(client.driver), group_id)
+    driver = _group_drivers.get(key)
+    if driver is None:
+        driver = client.driver.clone(database=group_id)
+        _group_drivers[key] = driver
+    return driver
+
+
+def _client_for_group(client: Graphiti, group_id: str) -> Graphiti:
+    """Return a Graphiti client whose driver is bound to the group's graph.
+
+    Mirrors core's own request-scope resolution: methods that use self.driver
+    (remove_episode, summarize_saga, add_triplet, get_nodes_and_edges_by_episode)
+    must see the group-scoped driver or they touch the default graph instead.
+    """
+    driver = _driver_for_group(client, group_id)
+    if driver is client.driver:
+        return client
+    scoped = copy.copy(client)
+    scoped.driver = driver
+    scoped.clients = client.clients.model_copy(update={'driver': driver})
+    return scoped
+
 
 # Global client for backward compatibility
 graphiti_client: Graphiti | None = None
@@ -213,6 +267,11 @@ class GraphitiService:
             except Exception as e:
                 logger.warning(f'Failed to create embedder client: {e}')
 
+            # Create cross-encoder (reranker) client. Without this, Graphiti defaults to
+            # OpenAIRerankerClient, which needs an OpenAI API key even on non-OpenAI setups.
+            # Reranker setup errors must remain fatal rather than silently restoring that default.
+            cross_encoder_client = CrossEncoderFactory.create(self.config.llm, self.config.embedder)
+
             # Get database configuration
             db_config = DatabaseDriverFactory.create_config(self.config.database)
 
@@ -232,6 +291,7 @@ class GraphitiService:
                     falkor_driver = FalkorDriver(
                         host=db_config['host'],
                         port=db_config['port'],
+                        username=db_config.get('username'),
                         password=db_config['password'],
                         database=db_config['database'],
                     )
@@ -240,17 +300,30 @@ class GraphitiService:
                         graph_driver=falkor_driver,
                         llm_client=llm_client,
                         embedder=embedder_client,
+                        cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
                     )
-                else:
-                    # For Neo4j (default), use the original approach
-                    self.client = Graphiti(
+                elif self.config.database.provider.lower() == 'neo4j':
+                    # For neo4j, create a Neo4jDriver instance directly
+                    from graphiti_core.driver.neo4j_driver import Neo4jDriver
+
+                    neo4j_driver = Neo4jDriver(
                         uri=db_config['uri'],
                         user=db_config['user'],
                         password=db_config['password'],
+                        database=db_config['database'],
+                    )
+
+                    self.client = Graphiti(
+                        graph_driver=neo4j_driver,
                         llm_client=llm_client,
                         embedder=embedder_client,
+                        cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
+                    )
+                else:
+                    raise ValueError(
+                        f'Unsupported database provider: {self.config.database.provider}'
                     )
             except Exception as db_error:
                 # Check for connection errors
@@ -336,6 +409,28 @@ class GraphitiService:
         if self.client is None:
             raise RuntimeError('Failed to initialize Graphiti client')
         return self.client
+
+
+async def _backpressure_error_response(exc: Exception) -> ErrorResponse:
+    """Build a machine-readable ErrorResponse for a fail-fast backpressure rejection."""
+    snapshot: dict[str, Any] = {}
+    if queue_service is not None:
+        try:
+            snapshot = await queue_service.get_resilience_snapshot()
+        except Exception:
+            snapshot = {}
+    state = snapshot.get('state', getattr(exc, 'state', 'unknown'))
+    depth = snapshot.get('queue_depth', '?')
+    max_depth = snapshot.get('max_queue_depth', 20)
+    retry_after = snapshot.get('retry_after_seconds') or config.resilience.open_timeout_seconds
+    message = (
+        f'graphiti_backpressure: circuit_state={state} '
+        f'queue_depth={depth}/{max_depth} '
+        f'retry_after_seconds={retry_after}. Episode NOT queued. '
+        f'Actions: search works; retry add_memory after ~{retry_after}s.'
+    )
+    logger.warning('add_memory rejected by backpressure: %s', message)
+    return ErrorResponse(error=message)
 
 
 @mcp.tool()
@@ -468,6 +563,10 @@ async def add_memory(
         return SuccessResponse(
             message=f"Episode '{name}' queued for processing in group '{effective_group_id}'"
         )
+    except (CircuitOpenError, QueueCapacityExceeded) as e:
+        # Fail-fast backpressure: the episode was NOT queued and NOT lost. Return a
+        # machine-readable error so the caller can retry after the cooldown.
+        return await _backpressure_error_response(e)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
@@ -632,11 +731,14 @@ async def search_memory_facts(
 
 
 @mcp.tool()
-async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
+async def delete_entity_edge(
+    uuid: str, group_id: str | None = None
+) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.
 
     Args:
         uuid: UUID of the entity edge to delete
+        group_id: Optional group ID. Falls back to the default group when omitted.
     """
     global graphiti_service
 
@@ -646,10 +748,14 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
     try:
         client = await graphiti_service.get_client()
 
+        effective_group_id = group_id or config.graphiti.group_id
+        driver = (
+            _driver_for_group(client, effective_group_id) if effective_group_id else client.driver
+        )
         # Get the entity edge by UUID
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        entity_edge = await EntityEdge.get_by_uuid(driver, uuid)
         # Delete the edge using its delete method
-        await entity_edge.delete(client.driver)
+        await entity_edge.delete(driver)
         return SuccessResponse(message=f'Entity edge with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
@@ -658,7 +764,7 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
 
 
 @mcp.tool()
-async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
+async def delete_episode(uuid: str, group_id: str | None = None) -> SuccessResponse | ErrorResponse:
     """Delete an episode from the graph memory.
 
     Uses Graphiti.remove_episode, which cascades the deletion: entities and facts
@@ -667,6 +773,7 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
 
     Args:
         uuid: UUID of the episode to delete
+        group_id: Optional group ID. Falls back to the default group when omitted.
     """
     global graphiti_service
 
@@ -676,9 +783,13 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
     try:
         client = await graphiti_service.get_client()
 
+        effective_group_id = group_id or config.graphiti.group_id
+        scoped_client = (
+            _client_for_group(client, effective_group_id) if effective_group_id else client
+        )
         # remove_episode cascades cleanup of episode-created entities/edges,
         # unlike EpisodicNode.delete which would orphan them.
-        await client.remove_episode(uuid)
+        await scoped_client.remove_episode(uuid)
         return SuccessResponse(message=f'Episode with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
@@ -687,11 +798,12 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
 
 
 @mcp.tool()
-async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
+async def get_entity_edge(uuid: str, group_id: str | None = None) -> dict[str, Any] | ErrorResponse:
     """Get an entity edge from the graph memory by its UUID.
 
     Args:
         uuid: UUID of the entity edge to retrieve
+        group_id: Optional group ID. Falls back to the default group when omitted.
     """
     global graphiti_service
 
@@ -701,8 +813,12 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     try:
         client = await graphiti_service.get_client()
 
+        effective_group_id = group_id or config.graphiti.group_id
+        driver = (
+            _driver_for_group(client, effective_group_id) if effective_group_id else client.driver
+        )
         # Get the entity edge directly using the EntityEdge class method
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        entity_edge = await EntityEdge.get_by_uuid(driver, uuid)
 
         # Use the format_fact_result function to serialize the edge
         # Return the Python dict directly - MCP will handle serialization
@@ -743,13 +859,23 @@ async def get_episodes(
             else []
         )
 
-        # Get episodes from the driver directly
-        from graphiti_core.nodes import EpisodicNode
-
+        # Each non-default group lives in its own graph, so query each group
+        # with a driver bound to that graph and merge the results. FalkorDB
+        # clones share one connection, which drops concurrent queries, so the
+        # loop stays sequential.
         if effective_group_ids:
-            episodes = await EpisodicNode.get_by_group_ids(
-                client.driver, effective_group_ids, limit=max_episodes
+            episodes = []
+            for group_id in effective_group_ids:
+                episodes.extend(
+                    await EpisodicNode.get_by_group_ids(
+                        _driver_for_group(client, group_id), [group_id], limit=max_episodes
+                    )
+                )
+            episodes.sort(
+                key=lambda episode: episode.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
             )
+            episodes = episodes[:max_episodes]
         else:
             # If no group IDs, we need to use a different approach
             # For now, return empty list when no group IDs specified
@@ -815,14 +941,16 @@ async def summarize_saga(
         # add_memory takes a saga *name*; core keys sagas by (name, group_id) and
         # assigns its own UUID, while summarize_saga requires that UUID. Resolve the
         # name to its UUID within the group before delegating to core.
-        sagas = await SagaNode.get_by_group_ids(client.driver, [effective_group_id])
+        sagas = await SagaNode.get_by_group_ids(
+            _driver_for_group(client, effective_group_id), [effective_group_id]
+        )
         match = next((saga for saga in sagas if saga.name == saga_name), None)
         if match is None:
             return ErrorResponse(
                 error=f"No saga named '{saga_name}' found in group '{effective_group_id}'"
             )
 
-        saga_node = await client.summarize_saga(match.uuid)
+        saga_node = await _client_for_group(client, effective_group_id).summarize_saga(match.uuid)
 
         return SagaSummaryResponse(
             message=f"Saga '{saga_name}' summarized successfully",
@@ -951,7 +1079,9 @@ async def add_triplet(
             created_at=now,
         )
 
-        result = await client.add_triplet(source_node, edge, target_node)
+        result = await _client_for_group(client, effective_group_id).add_triplet(
+            source_node, edge, target_node
+        )
 
         return TripletResponse(
             message=f"Triplet '{source_node_name} -[{edge_name}]-> {target_node_name}' added",
@@ -967,6 +1097,7 @@ async def add_triplet(
 @mcp.tool()
 async def get_episode_entities(
     episode_uuids: list[str],
+    group_id: str | None = None,
 ) -> EpisodeEntitiesResponse | ErrorResponse:
     """Get the entities (nodes) and facts (edges) created by specific episodes.
 
@@ -975,6 +1106,7 @@ async def get_episode_entities(
 
     Args:
         episode_uuids: List of episode UUIDs to look up provenance for
+        group_id: Optional group ID. Falls back to the default group when omitted.
     """
     global graphiti_service
 
@@ -987,7 +1119,11 @@ async def get_episode_entities(
     try:
         client = await graphiti_service.get_client()
 
-        results = await client.get_nodes_and_edges_by_episode(episode_uuids)
+        effective_group_id = group_id or config.graphiti.group_id
+        scoped_client = (
+            _client_for_group(client, effective_group_id) if effective_group_id else client
+        )
+        results = await scoped_client.get_nodes_and_edges_by_episode(episode_uuids)
 
         return EpisodeEntitiesResponse(
             message=f'Retrieved provenance for {len(episode_uuids)} episode(s)',
@@ -1031,8 +1167,9 @@ async def clear_graph(
         if not effective_group_ids:
             return ErrorResponse(error='No group IDs specified for clearing')
 
-        # Clear data for the specified group IDs
-        await clear_data(client.driver, group_ids=effective_group_ids)
+        # Clear data per group: each non-default group lives in its own graph.
+        for group_id in effective_group_ids:
+            await clear_data(_driver_for_group(client, group_id), group_ids=[group_id])
 
         return SuccessResponse(
             message=f'Graph data cleared successfully for group IDs: {", ".join(effective_group_ids)}'
@@ -1079,12 +1216,27 @@ async def get_status() -> StatusResponse:
 @mcp.custom_route('/health', methods=['GET'])
 async def health_check(request) -> JSONResponse:
     """Health check endpoint for Docker and load balancers."""
-    return JSONResponse({'status': 'healthy', 'service': 'graphiti-mcp'})
+    body: dict[str, Any] = {'status': 'healthy', 'service': 'graphiti-mcp'}
+
+    if queue_service is not None:
+        try:
+            snapshot = await queue_service.get_resilience_snapshot()
+        except Exception as e:
+            snapshot = {'state': 'error', 'detail': str(e)}
+        body['circuit_breaker'] = snapshot.get('state', 'unknown')
+        body['queue_depth'] = snapshot.get('queue_depth', 0)
+        body['max_queue_depth'] = snapshot.get('max_queue_depth', 20)
+        body['pending_episodes'] = snapshot.get('pending_episodes', 0)
+        body['retry_after_seconds'] = snapshot.get('retry_after_seconds', 0)
+        if snapshot.get('state') in ('open', 'half_open'):
+            body['status'] = 'degraded'
+
+    return JSONResponse(body)
 
 
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
-    global config, graphiti_service, queue_service, graphiti_client, semaphore
+    global config, graphiti_service, queue_service, episode_retryer, graphiti_client, semaphore
 
     parser = argparse.ArgumentParser(
         description='Run the Graphiti MCP server with YAML configuration support'
@@ -1208,7 +1360,7 @@ async def initialize_server() -> ServerConfig:
 
     # Initialize services
     graphiti_service = GraphitiService(config, SEMAPHORE_LIMIT)
-    queue_service = QueueService()
+    queue_service = QueueService(config.resilience)
     await graphiti_service.initialize()
 
     # Set global client for backward compatibility
@@ -1218,11 +1370,53 @@ async def initialize_server() -> ServerConfig:
     # Initialize queue service with the client
     await queue_service.initialize(graphiti_client)
 
-    # Set MCP server settings
-    if config.server.host:
-        mcp.settings.host = config.server.host
-    if config.server.port:
-        mcp.settings.port = config.server.port
+    # Start the spool retryer if resilience is enabled.
+    if config.resilience.enabled and config.resilience.spool_enabled and queue_service.spool is not None:
+        resilience = config.resilience
+
+        def episode_builder(plan: dict[str, Any]) -> dict[str, Any]:
+            """Rebuild graphiti.add_episode kwargs from a persisted spool plan.
+
+            Complex structures (entity_types/edge_types/edge_type_map and the
+            EpisodeType enum) are not persisted; they are rebuilt from the live
+            service, mirroring what add_memory passes at queued time.
+            """
+            ref = parse_reference_time(plan.get('reference_time'))
+            return {
+                'name': plan['name'],
+                'episode_body': plan['episode_body'],
+                'source_description': plan['source_description'],
+                'source': EpisodeType[plan['source']],
+                'group_id': plan['group_id'],
+                'reference_time': ref or datetime.now(timezone.utc),
+                'entity_types': graphiti_service.entity_types,
+                'edge_types': graphiti_service.edge_types,
+                'edge_type_map': graphiti_service.edge_type_map,
+                'excluded_entity_types': plan.get('excluded_entity_types'),
+                'previous_episode_uuids': plan.get('previous_episode_uuids'),
+                'custom_extraction_instructions': plan.get('custom_extraction_instructions'),
+                'update_communities': plan.get('update_communities', False),
+                'saga': plan.get('saga'),
+                'saga_previous_episode_uuid': plan.get('saga_previous_episode_uuid'),
+                'uuid': plan.get('uuid'),
+            }
+
+        episode_retryer = EpisodeRetryer(
+            spool=queue_service.spool,
+            breaker=queue_service.circuit_breaker,
+            episode_builder=episode_builder,
+            graphiti_client=graphiti_client,
+            interval_seconds=resilience.retryer_interval_seconds,
+            max_attempts=resilience.max_spool_attempts,
+            backoff_base_seconds=resilience.spool_backoff_base_seconds,
+        )
+        episode_retryer.start()
+        logger.info(
+            'Episode retryer armed (spool=%s, interval=%ss, max_attempts=%d)',
+            queue_service.spool.root,
+            resilience.retryer_interval_seconds,
+            resilience.max_spool_attempts,
+        )
 
     # Return MCP configuration for transport
     return config.server
@@ -1238,21 +1432,19 @@ async def run_mcp_server():
     if mcp_config.transport == 'stdio':
         await mcp.run_stdio_async()
     elif mcp_config.transport == 'sse':
-        logger.info(
-            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
-        )
-        logger.info(f'Access the server at: http://{mcp.settings.host}:{mcp.settings.port}/sse')
-        await mcp.run_sse_async()
+        logger.info(f'Running MCP server with SSE transport on {mcp_config.host}:{mcp_config.port}')
+        logger.info(f'Access the server at: http://{mcp_config.host}:{mcp_config.port}/sse')
+        await mcp.run_sse_async(host=mcp_config.host, port=mcp_config.port)
     elif mcp_config.transport == 'http':
         # Use localhost for display if binding to 0.0.0.0
-        display_host = 'localhost' if mcp.settings.host == '0.0.0.0' else mcp.settings.host
+        display_host = 'localhost' if mcp_config.host == '0.0.0.0' else mcp_config.host
         logger.info(
-            f'Running MCP server with streamable HTTP transport on {mcp.settings.host}:{mcp.settings.port}'
+            f'Running MCP server with streamable HTTP transport on {mcp_config.host}:{mcp_config.port}'
         )
         logger.info('=' * 60)
         logger.info('MCP Server Access Information:')
-        logger.info(f'  Base URL: http://{display_host}:{mcp.settings.port}/')
-        logger.info(f'  MCP Endpoint: http://{display_host}:{mcp.settings.port}/mcp/')
+        logger.info(f'  Base URL: http://{display_host}:{mcp_config.port}/')
+        logger.info(f'  MCP Endpoint: http://{display_host}:{mcp_config.port}/mcp/')
         logger.info('  Transport: HTTP (streamable)')
 
         # Show FalkorDB Browser UI access if enabled
@@ -1265,7 +1457,7 @@ async def run_mcp_server():
         # Configure uvicorn logging to match our format
         configure_uvicorn_logging()
 
-        await mcp.run_streamable_http_async()
+        await mcp.run_streamable_http_async(host=mcp_config.host, port=mcp_config.port)
     else:
         raise ValueError(
             f'Unsupported transport: {mcp_config.transport}. Use "sse", "stdio", or "http"'

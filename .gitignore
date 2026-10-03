@@ -166,3 +166,5 @@ cache.db*
 
 # All DS_Store files
 .DS_Store
+# Resilience: disk spool of failed episode writes (may contain private episode content)
+spool/
