@@ -1418,11 +1418,6 @@ async def initialize_server() -> ServerConfig:
             resilience.max_spool_attempts,
         )
 
-    # Set MCP server settings
-    if config.server.host:
-        mcp.settings.host = config.server.host
-    if config.server.port:
-        mcp.settings.port = config.server.port
     # Return MCP configuration for transport
     return config.server
 
