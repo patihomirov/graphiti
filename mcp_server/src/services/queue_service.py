@@ -18,6 +18,15 @@ from services.episode_spool import EpisodeSpool
 logger = logging.getLogger(__name__)
 
 
+class ServerStoppingError(Exception):
+    """Raised when an episode is submitted while the server is stopping.
+
+    The episode is NOT queued and NOT lost: the caller receives a
+    ``graphiti_backpressure:`` response and is expected to retry after the
+    server has restarted (pending episodes are spilled to the disk spool).
+    """
+
+
 class QueueService:
     """Service for managing sequential episode processing queues by group_id.
 
@@ -44,6 +53,13 @@ class QueueService:
         self._episode_queues: dict[str, asyncio.Queue] = {}
         # Dictionary to track if a worker is running for each group_id
         self._queue_workers: dict[str, bool] = {}
+        # Worker task handles per group_id, used to cancel in-flight episodes
+        # during a graceful drain.
+        self._worker_tasks: dict[str, asyncio.Task] = {}
+        # True while a worker is awaiting its process_func (episode in flight).
+        self._busy: dict[str, bool] = {}
+        # Flipped by the graceful shutdown coordinator on SIGTERM/SIGINT.
+        self._stopping: bool = False
         # Store the graphiti client after initialization
         self._graphiti_client: Any = None
 
@@ -86,9 +102,15 @@ class QueueService:
             The position in the queue
 
         Raises:
+            ServerStoppingError: If the server is shutting down (fail fast).
             CircuitOpenError: If the circuit breaker is open (fail fast).
             QueueCapacityExceeded: If the queue depth limit is reached (fail fast).
         """
+        if self._stopping:
+            raise ServerStoppingError(
+                'Server is stopping (graceful drain in progress). '
+                'Episode NOT queued; retry after the server restarts.'
+            )
         if self.resilience.enabled:
             async with self._depth_lock:
                 if self._breaker is not None:
@@ -118,7 +140,8 @@ class QueueService:
                 # cannot spawn duplicate workers for the same group_id.
                 if not self._queue_workers.get(group_id, False):
                     self._queue_workers[group_id] = True
-                    asyncio.create_task(self._process_episode_queue(group_id))
+                    task = asyncio.create_task(self._process_episode_queue(group_id))
+                    self._worker_tasks[group_id] = task
 
                 return self._episode_queues[group_id].qsize()
 
@@ -131,7 +154,8 @@ class QueueService:
         # Claim the worker slot before scheduling (same reasoning as above).
         if not self._queue_workers.get(group_id, False):
             self._queue_workers[group_id] = True
-            asyncio.create_task(self._process_episode_queue(group_id))
+            task = asyncio.create_task(self._process_episode_queue(group_id))
+            self._worker_tasks[group_id] = task
 
         return self._episode_queues[group_id].qsize()
 
@@ -152,9 +176,26 @@ class QueueService:
                 process_func, plan = await self._episode_queues[group_id].get()
 
                 try:
+                    # Mark the worker busy so the graceful drain knows this
+                    # episode is in flight (not merely pending in the queue).
+                    self._busy[group_id] = True
                     # Process the episode
                     await process_func()
                 except asyncio.CancelledError:
+                    # The graceful drain cancels workers whose in-flight episode
+                    # did not finish within the grace window. Spool it so the
+                    # retryer replays it after restart instead of losing it.
+                    if self._stopping and self._spool is not None and plan is not None:
+                        try:
+                            self._spool.save(plan, reason='cancelled during graceful drain')
+                            logger.warning(
+                                'Graceful drain: spooled in-flight episode %s (name=%s) of group %s',
+                                plan.get('uuid'),
+                                plan.get('name'),
+                                group_id,
+                            )
+                        except Exception as se:
+                            logger.error(f'Failed to spool cancelled episode {plan.get("uuid")}: {se}')
                     raise
                 except Exception as e:
                     await self._handle_processing_failure(group_id, plan, e)
@@ -162,6 +203,7 @@ class QueueService:
                     if self._breaker is not None:
                         await self._breaker.record_success()
                 finally:
+                    self._busy[group_id] = False
                     # Decrement the shared depth invariant and mark done regardless
                     # of success/failure.
                     self._queue_depth = max(0, self._queue_depth - 1)
@@ -204,6 +246,92 @@ class QueueService:
             return 0
         return self._episode_queues[group_id].qsize()
 
+    @property
+    def stopping(self) -> bool:
+        """True once a graceful shutdown drain has been initiated."""
+        return self._stopping
+
+    def begin_stopping(self) -> None:
+        """Flip the stopping flag; every further add_memory is rejected."""
+        if not self._stopping:
+            self._stopping = True
+            logger.warning('Queue service entering stopping mode: new episodes will be rejected')
+
+    def _any_busy(self) -> bool:
+        """Whether any worker currently has an episode in flight."""
+        return any(self._busy.get(g, False) for g in self._episode_queues)
+
+    async def drain(self, wait_current_seconds: float = 7.0) -> dict[str, Any]:
+        """Spill every pending episode to the disk spool and drain in-flight work.
+
+        Called from the graceful shutdown coordinator on SIGTERM/SIGINT (and
+        once more, idempotently, on server exit). Steps:
+
+        1. Reject new submissions (stopping flag).
+        2. Move every queued-but-unprocessed episode to the disk spool.
+        3. Give the in-flight episode a grace window to finish; on timeout
+           cancel its worker, which spools the cancelled episode.
+        """
+        self.begin_stopping()
+        start = asyncio.get_running_loop().time()
+
+        spooled_pending = 0
+        for group_id in list(self._episode_queues):
+            queue = self._episode_queues[group_id]
+            while True:
+                try:
+                    _, plan = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._queue_depth = max(0, self._queue_depth - 1)
+                queue.task_done()
+                if plan is None:
+                    logger.error(
+                        'Graceful drain: pending episode in group %s has no spoolable plan; it is lost', group_id
+                    )
+                    continue
+                if self._spool is None:
+                    logger.error(
+                        'Graceful drain: spool disabled, pending episode %s (name=%s) cannot be persisted',
+                        plan.get('uuid'),
+                        plan.get('name'),
+                    )
+                    continue
+                try:
+                    self._spool.save(plan, reason='graceful drain on shutdown')
+                    spooled_pending += 1
+                except Exception as e:
+                    logger.error('Graceful drain: failed to spool episode %s: %s', plan.get('uuid'), e)
+
+        deadline = start + wait_current_seconds
+        while self._any_busy() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+        waited_seconds = asyncio.get_running_loop().time() - start
+
+        cancelled_workers: list[asyncio.Task] = []
+        if self._any_busy():
+            cancelled_workers = [
+                task
+                for group_id, task in self._worker_tasks.items()
+                if self._busy.get(group_id, False) and not task.done()
+            ]
+            for task in cancelled_workers:
+                task.cancel()
+            if cancelled_workers:
+                await asyncio.gather(*cancelled_workers, return_exceptions=True)
+
+        logger.warning(
+            'Graceful drain: spooled %d pending, waited current %.1fs, cancelled %d overdue worker(s)',
+            spooled_pending,
+            waited_seconds,
+            len(cancelled_workers),
+        )
+        return {
+            'spooled_pending': spooled_pending,
+            'waited_seconds': round(waited_seconds, 2),
+            'cancelled_workers': len(cancelled_workers),
+        }
+
     def is_worker_running(self, group_id: str) -> bool:
         """Check if a worker is running for a group_id."""
         return self._queue_workers.get(group_id, False)
@@ -243,6 +371,7 @@ class QueueService:
         snapshot['max_queue_depth'] = self.resilience.max_queue_depth
         snapshot['spool_enabled'] = self._spool is not None
         snapshot['pending_episodes'] = self._spool.count_pending() if self._spool is not None else 0
+        snapshot['stopping'] = self._stopping
         return snapshot
 
     async def add_episode(

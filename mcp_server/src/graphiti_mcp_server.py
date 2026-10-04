@@ -47,7 +47,8 @@ from services.factories import (
     EmbedderFactory,
     LLMClientFactory,
 )
-from services.queue_service import QueueService
+from services.queue_service import QueueService, ServerStoppingError
+from services.shutdown import GracefulShutdownCoordinator
 from utils.formatting import format_fact_result, to_edge_result, to_node_result
 from utils.type_config import (
     build_edge_type_map,
@@ -423,8 +424,10 @@ async def _backpressure_error_response(exc: Exception) -> ErrorResponse:
     depth = snapshot.get('queue_depth', '?')
     max_depth = snapshot.get('max_queue_depth', 20)
     retry_after = snapshot.get('retry_after_seconds') or config.resilience.open_timeout_seconds
+    stopping = snapshot.get('stopping', False)
     message = (
         f'graphiti_backpressure: circuit_state={state} '
+        f'server_stopping={stopping} '
         f'queue_depth={depth}/{max_depth} '
         f'retry_after_seconds={retry_after}. Episode NOT queued. '
         f'Actions: search works; retry add_memory after ~{retry_after}s.'
@@ -563,7 +566,7 @@ async def add_memory(
         return SuccessResponse(
             message=f"Episode '{name}' queued for processing in group '{effective_group_id}'"
         )
-    except (CircuitOpenError, QueueCapacityExceeded) as e:
+    except (CircuitOpenError, QueueCapacityExceeded, ServerStoppingError) as e:
         # Fail-fast backpressure: the episode was NOT queued and NOT lost. Return a
         # machine-readable error so the caller can retry after the cooldown.
         return await _backpressure_error_response(e)
@@ -1427,14 +1430,25 @@ async def run_mcp_server():
     # Initialize the server
     mcp_config = await initialize_server()
 
+    # Graceful shutdown coordinator: on SIGTERM/SIGINT it rejects new episodes
+    # (backpressure), spills pending queue items to the disk spool and gives
+    # the in-flight episode a grace window before the process exits.
+    coordinator = GracefulShutdownCoordinator(
+        queue_service=queue_service,
+        retryer=episode_retryer,
+        drain_timeout_seconds=7.0,
+    )
+
     # Run the server with configured transport
     logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
     if mcp_config.transport == 'stdio':
         await mcp.run_stdio_async()
+        await coordinator.finalize()
     elif mcp_config.transport == 'sse':
         logger.info(f'Running MCP server with SSE transport on {mcp_config.host}:{mcp_config.port}')
         logger.info(f'Access the server at: http://{mcp_config.host}:{mcp_config.port}/sse')
         await mcp.run_sse_async(host=mcp_config.host, port=mcp_config.port)
+        await coordinator.finalize()
     elif mcp_config.transport == 'http':
         # Use localhost for display if binding to 0.0.0.0
         display_host = 'localhost' if mcp_config.host == '0.0.0.0' else mcp_config.host
@@ -1457,7 +1471,31 @@ async def run_mcp_server():
         # Configure uvicorn logging to match our format
         configure_uvicorn_logging()
 
-        await mcp.run_streamable_http_async(host=mcp_config.host, port=mcp_config.port)
+        # Own the uvicorn server instead of calling
+        # mcp.run_streamable_http_async(): we need timeout_graceful_shutdown so a
+        # SIGTERM always reaches our drain window even with long-lived
+        # streamable-HTTP sessions, and a Server handle so the shutdown
+        # coordinator can request exit while the drain runs concurrently.
+        import uvicorn
+
+        starlette_app = mcp.streamable_http_app()
+        uvicorn_config = uvicorn.Config(
+            starlette_app,
+            host=mcp_config.host,
+            port=mcp_config.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        uvicorn_config.timeout_graceful_shutdown = 5.0
+        server = uvicorn.Server(uvicorn_config)
+        coordinator.server = server
+
+        serve_task = asyncio.create_task(server.serve(), name='mcp-http-server')
+        # Signal handlers must be installed after uvicorn captured its own
+        # (it would otherwise swallow SIGTERM waiting on open sessions).
+        await coordinator.install_after(serve_task)
+        await serve_task
+        drain_result = await coordinator.finalize()
+        logger.info('Graceful shutdown complete: %s', drain_result)
     else:
         raise ValueError(
             f'Unsupported transport: {mcp_config.transport}. Use "sse", "stdio", or "http"'
