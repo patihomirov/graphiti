@@ -289,6 +289,11 @@ class ResilienceConfig(BaseModel):
     open_timeout_seconds: float = Field(
         default=30.0, description='Cooldown before the breaker tries a half-open probe'
     )
+    probe_timeout_seconds: float = Field(
+        default=60.0,
+        description='A half-open probe not resolved within this time is re-granted '
+        '(guards against a consumed-but-forgotten probe stranding the breaker)',
+    )
     spool_enabled: bool = Field(default=True, description='Enable disk spooling of failed episodes')
     spool_dir: str = Field(
         default='~/.graphiti/spool',

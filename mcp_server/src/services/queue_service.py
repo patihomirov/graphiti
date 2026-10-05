@@ -73,6 +73,7 @@ class QueueService:
             self._breaker = CircuitBreaker(
                 failure_threshold=self.resilience.failure_threshold,
                 open_timeout_seconds=self.resilience.open_timeout_seconds,
+                probe_timeout_seconds=self.resilience.probe_timeout_seconds,
             )
             if self.resilience.spool_enabled:
                 self._spool = EpisodeSpool(
