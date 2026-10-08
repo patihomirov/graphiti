@@ -195,18 +195,29 @@ class QueueService:
         workers claim rows directly from the journal table (claim semantics).
         """
         async with self._depth_lock:
+            breakthrough = self.resilience.enqueue_breakthrough_max_pending
             if self._breaker is not None:
                 allowed = await self._breaker.allow_request()
-                if not allowed:
+                # Phase 4 bounded breakthrough: while the breaker is OPEN,
+                # allow enqueues up to max_queue_depth + breakthrough so
+                # canaries / critical episodes still reach the durable journal
+                # (and drain on a live fallback via per-model routing) instead
+                # of being rejected with graphiti_backpressure:. The capacity
+                # check below bounds the accumulation, so the gateway is never
+                # hammered.
+                if not allowed and (breakthrough <= 0 or self._breaker.state != 'open'):
                     snap = await self._breaker.get_snapshot()
                     raise CircuitOpenError(
                         f'Circuit is open (state={snap["state"]}). '
                         f'Rejecting episode; retry in ~{snap["retry_after_seconds"]}s.'
                     )
             unfinished = await self._journal.count_unfinished()
-            if unfinished >= self.resilience.max_queue_depth:
+            capacity = self.resilience.max_queue_depth
+            if self._breaker is not None and self._breaker.state == 'open':
+                capacity += breakthrough
+            if unfinished >= capacity:
                 raise QueueCapacityExceeded(
-                    f'Queue depth {unfinished} >= max {self.resilience.max_queue_depth}. '
+                    f'Queue depth {unfinished} >= max {capacity}. '
                     'Rejecting episode; retry once the queue drains.'
                 )
             _, inserted = await self._journal.enqueue(plan)

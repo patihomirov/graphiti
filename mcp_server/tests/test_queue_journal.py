@@ -785,3 +785,52 @@ class TestPhase4ConfigDefaults:
         assert cfg.model_reputation_window_seconds == 120.0
         assert cfg.model_reputation_429_per_min_threshold == 10.0
         assert cfg.model_reputation_429_cooldown_seconds == 15.0
+
+
+class TestPhase4BreakthroughIntake:
+    """Phase 4: bounded breakthrough enqueue while the circuit breaker is OPEN."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_open_breaker_breakthrough_allows_bounded_enqueue(self, tmp_path):
+        from graphiti_core.llm_client.errors import RateLimitError
+
+        cfg = make_config(tmp_path / 'brk.db').model_copy(
+            update=dict(max_queue_depth=5, enqueue_breakthrough_max_pending=3)
+        )
+        # NOT initialized: no pool workers, so row counts stay deterministic.
+        service = QueueService(cfg)
+        try:
+            for _ in range(3):
+                await service._breaker.record_failure(RateLimitError())
+            assert service._breaker.state == 'open'
+            # Both zones fill while the breaker stays open (no CircuitOpenError).
+            for i in range(5):
+                await service._add_episode_task_journal('g1', make_plan(uuid=f'brk-{i}'))
+            assert await service.journal.count_pending() == 5
+            # Breakthrough zone: 3 more accepted past max_queue_depth.
+            for i in range(3):
+                await service._add_episode_task_journal('g1', make_plan(uuid=f'boom-{i}'))
+            assert await service.journal.count_pending() == 8
+            # Past max_queue_depth + breakthrough -> capacity reject, not backpressure.
+            with pytest.raises(QueueCapacityExceeded):
+                await service._add_episode_task_journal('g1', make_plan(uuid='overflow'))
+        finally:
+            await service.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_open_breaker_breakthrough_default_rejects(self, tmp_path):
+        """breakthrough=0 (default): an open breaker still rejects - regression."""
+        from graphiti_core.llm_client.errors import RateLimitError
+
+        service = QueueService(make_config(tmp_path / 'brk0.db'))
+        try:
+            for _ in range(3):
+                await service._breaker.record_failure(RateLimitError())
+            assert service._breaker.state == 'open'
+            with pytest.raises(CircuitOpenError):
+                await service._add_episode_task_journal('g1', make_plan(uuid='u-brk0'))
+            assert await service.journal.count_pending() == 0
+        finally:
+            await service.close()
