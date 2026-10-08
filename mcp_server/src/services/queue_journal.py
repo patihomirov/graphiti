@@ -60,6 +60,7 @@ _ROW_COLUMNS = (
     'last_attempt_ts',
     'next_retry_at',
     'error',
+    'requires_serial',
     'created_at',
     'updated_at',
 )
@@ -82,12 +83,14 @@ CREATE TABLE IF NOT EXISTS episode_queue (
     last_attempt_ts  TEXT,
     next_retry_at  TEXT,
     error          TEXT,
+    requires_serial INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_episode_queue_dedup ON episode_queue(dedup_key);
 CREATE INDEX IF NOT EXISTS idx_episode_queue_due ON episode_queue(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_episode_queue_fifo ON episode_queue(group_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_episode_queue_serial ON episode_queue(group_id, status, requires_serial, id);
 """
 
 _SELECT_ROW = f"""
@@ -123,6 +126,23 @@ def compute_dedup_key(plan: dict[str, Any]) -> str:
     return f'sha256:{digest}'
 
 
+def plan_requires_serial(plan: dict[str, Any]) -> bool:
+    """Whether a plan depends on strictly serial (in-order) processing.
+
+    A row is serial - only the group leader may claim it - when it performs
+    auto-retrieval of previous episodes (no ``previous_episode_uuids``), starts
+    or forks a saga without an explicit ``saga_previous_episode_uuid``, or asks
+    for a community refresh (``update_communities``). Parallel-safe is only a
+    plan with an explicit, already-written ``previous_episode_uuids`` list and,
+    when it has a saga, an explicit ``saga_previous_episode_uuid``.
+    """
+    if not plan.get('previous_episode_uuids'):
+        return True
+    if plan.get('saga') and not plan.get('saga_previous_episode_uuid'):
+        return True
+    return bool(plan.get('update_communities'))
+
+
 class QueueJournal:
     """Durable SQLite journal backing the episode write path."""
 
@@ -140,6 +160,7 @@ class QueueJournal:
             self._conn.execute('PRAGMA synchronous=NORMAL')
             self._conn.execute('PRAGMA busy_timeout=5000')
             self._conn.executescript(_SCHEMA)
+            self._apply_migrations()
             self._conn.commit()
             # sqlite_version >= 3.35 supports UPDATE ... RETURNING (claimed via
             # a single statement); older builds get the BEGIN IMMEDIATE fallback.
@@ -150,6 +171,22 @@ class QueueJournal:
                 self._conn.close()  # type: ignore[has-type]
             raise
         logger.info('SQLite journal ready: %s (lease=%ss)', self.db_path, self.lease_seconds)
+
+    def _apply_migrations(self) -> None:
+        """Idempotently bring an older journal up to the current schema.
+
+        ``ALTER TABLE ADD COLUMN`` is not idempotent, so each additive step is
+        gated on ``PRAGMA table_info`` (rather than a try/except swallows
+        errors). Runs once per connection, synchronously on startup.
+        """
+        existing = {row[1] for row in self._conn.execute('PRAGMA table_info(episode_queue)')}
+        if 'requires_serial' not in existing:
+            # Rows created before the column existed default to the serial-safe
+            # group FIFO (0 = parallel-safe is only set going forward by enqueue).
+            self._conn.execute(
+                'ALTER TABLE episode_queue '
+                'ADD COLUMN requires_serial INTEGER NOT NULL DEFAULT 0'
+            )
 
     # ------------------------------------------------------------- plumbing
 
@@ -201,6 +238,7 @@ class QueueJournal:
         now = _now_iso()
         plan_json = json.dumps(plan, ensure_ascii=False, sort_keys=True)
         created_at = now
+        serial = int(plan_requires_serial(plan))
         params = (
             dedup_key,
             plan.get('uuid'),
@@ -208,22 +246,23 @@ class QueueJournal:
             plan['name'],
             plan['episode_body'],
             plan_json,
+            serial,
             created_at,
             created_at,
         )
         sql = (
             'INSERT OR IGNORE INTO episode_queue '
             '(dedup_key, uuid, group_id, name, episode_body, plan_json, '
-            ' created_at, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+            ' requires_serial, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
             'RETURNING id'
         )
         if not self._has_returning:
             sql = (
                 'INSERT OR IGNORE INTO episode_queue '
                 '(dedup_key, uuid, group_id, name, episode_body, plan_json, '
-                ' created_at, updated_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                ' requires_serial, created_at, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
             )
         async with self._lock:
             cur = await asyncio.to_thread(self._exec_sync, sql, params)
@@ -245,7 +284,25 @@ class QueueJournal:
             raise sqlite3.IntegrityError(f'Missing duplicate row for dedup_key {dedup_key}')
         return int(row[0])
 
-    async def claim_next(self, group_id: str, worker_id: str) -> dict[str, Any] | None:
+    def _claim_where(self, leader: bool) -> str:
+        """Claim WHERE fragment; non-leaders may only take serial-safe rows.
+
+        A serial row depends on context ordering (auto-retrieve of previous
+        episodes, a saga without its predecessor, or ``update_communities``),
+        so only the group leader may claim it; parallel-safe rows (explicit
+        already-written ``previous_episode_uuids`` / ``saga_previous_episode_uuid``)
+        can go to any worker.
+        """
+        if leader:
+            return "(status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?))"
+        return (
+            "(status = 'pending' AND requires_serial = 0 "
+            "AND (next_retry_at IS NULL OR next_retry_at <= ?))"
+        )
+
+    async def claim_next(
+        self, group_id: str, worker_id: str, leader: bool = True
+    ) -> dict[str, Any] | None:
         """Atomically claim the oldest pending row for a group (FIFO).
 
         Uses a single ``UPDATE ... RETURNING`` (sqlite >= 3.35); for older SQLite
@@ -254,14 +311,14 @@ class QueueJournal:
         """
         now = _now_iso()
         lease_until = _later_iso(self.lease_seconds)
+        where = self._claim_where(leader)
         if self._has_returning:
             sql = f"""
                 UPDATE episode_queue
                 SET status='processing', worker_id=?, lease_until=?, updated_at=?
                 WHERE id = (
                     SELECT id FROM episode_queue
-                    WHERE group_id = ? AND status = 'pending'
-                      AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    WHERE group_id = ? AND {where}
                     ORDER BY id LIMIT 1
                 )
                 RETURNING {', '.join(_ROW_COLUMNS)}
@@ -276,8 +333,7 @@ class QueueJournal:
         # Fallback for sqlite < 3.35: BEGIN IMMEDIATE + SELECT + UPDATE.
         select_sql = (
             'SELECT id FROM episode_queue '
-            'WHERE group_id = ? AND status = \'pending\' '
-            'AND (next_retry_at IS NULL OR next_retry_at <= ?) '
+            f'WHERE group_id = ? AND {where} '
             'ORDER BY id LIMIT 1'
         )
         update_sql = (
