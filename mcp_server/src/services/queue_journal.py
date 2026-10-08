@@ -90,7 +90,6 @@ CREATE TABLE IF NOT EXISTS episode_queue (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_episode_queue_dedup ON episode_queue(dedup_key);
 CREATE INDEX IF NOT EXISTS idx_episode_queue_due ON episode_queue(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_episode_queue_fifo ON episode_queue(group_id, status, id);
-CREATE INDEX IF NOT EXISTS idx_episode_queue_serial ON episode_queue(group_id, status, requires_serial, id);
 """
 
 _SELECT_ROW = f"""
@@ -187,6 +186,12 @@ class QueueJournal:
                 'ALTER TABLE episode_queue '
                 'ADD COLUMN requires_serial INTEGER NOT NULL DEFAULT 0'
             )
+        # Created here (after any ALTER) so it is valid on both fresh and
+        # migrated journals; an early CREATE with the missing column would fail.
+        self._conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_episode_queue_serial '
+            'ON episode_queue(group_id, status, requires_serial, id)'
+        )
 
     # ------------------------------------------------------------- plumbing
 

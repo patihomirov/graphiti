@@ -16,7 +16,7 @@ import pytest
 from graphiti_core import Graphiti
 
 from config.schema import ResilienceConfig
-from services.queue_journal import QueueJournal, compute_dedup_key
+from services.queue_journal import QueueJournal, compute_dedup_key, plan_requires_serial
 from services.queue_service import (
     CircuitOpenError,
     QueueCapacityExceeded,
@@ -446,3 +446,153 @@ async def wait_until(predicate, timeout: float = 5.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError('Timed out waiting for condition')
         await asyncio.sleep(0.02)
+
+
+class TestSerialPolicyAndLease:
+    """Phase 2: serial-zone flag, leader claim guard, lease heartbeat/steward."""
+
+    @pytest.mark.unit
+    def test_plan_requires_serial_matrix(self):
+        # No previous episodes -> auto-retrieve context -> serial.
+        assert plan_requires_serial(make_plan(previous_episode_uuids=None)) is True
+        assert plan_requires_serial(make_plan(previous_episode_uuids=[])) is True
+        # Explicit already-written previous episodes -> parallel-safe.
+        assert plan_requires_serial(make_plan(previous_episode_uuids=['u-1', 'u-2'])) is False
+        # Saga starting/forking without its predecessor -> serial.
+        assert plan_requires_serial(make_plan(saga='saga', saga_previous_episode_uuid=None)) is True
+        # Saga with an explicit predecessor -> parallel-safe.
+        assert (
+            plan_requires_serial(
+                make_plan(
+                    previous_episode_uuids=['u-1'],
+                    saga='saga',
+                    saga_previous_episode_uuid='u-1',
+                )
+            )
+            is False
+        )
+        # Community refresh -> serial.
+        assert plan_requires_serial(make_plan(update_communities=True)) is True
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_claim_leader_picks_serial_first(self, journal):
+        # Group has a serial row followed by a parallel-safe row.
+        await journal.enqueue(make_plan(uuid='lp-serial'))
+        await journal.enqueue(
+            make_plan(uuid='lp-para', previous_episode_uuids=['u-written'])
+        )
+        # The leader claims the oldest pending row regardless of the flag.
+        first = await journal.claim_next('g1', 'w-leader', leader=True)
+        assert first is not None
+        assert first['uuid'] == 'lp-serial'
+        assert first['requires_serial'] == 1
+        second = await journal.claim_next('g1', 'w-leader', leader=True)
+        assert second is not None
+        assert second['uuid'] == 'lp-para'
+        assert second['requires_serial'] == 0
+        await journal.mark_done(first['id'])
+        await journal.mark_done(second['id'])
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_claim_non_leader_skips_serial(self, journal):
+        await journal.enqueue(make_plan(uuid='ns-serial'))
+        assert await journal.claim_next('g1', 'w-follower', leader=False) is None
+        serial = await journal.claim_next('g1', 'w-leader', leader=True)
+        assert serial is not None and serial['requires_serial'] == 1
+        await journal.mark_done(serial['id'])
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_heartbeat_renews_lease_and_guards_owner(self, journal):
+        await journal.enqueue(make_plan(uuid='hb-1'))
+        claimed = await journal.claim_next('g1', 'w1')
+        row_id = claimed['id']
+        old_lease = claimed['lease_until']
+        # Owner renews; the lease moves forward (ISO strings compare lexically).
+        assert await journal.heartbeat(row_id, 'w1') is True
+        cur = sqlite3.connect(journal.db_path)
+        try:
+            lease = cur.execute(
+                'SELECT lease_until FROM episode_queue WHERE id=?', (row_id,)
+            ).fetchone()[0]
+        finally:
+            cur.close()
+        assert lease > old_lease
+        # A different worker cannot renew it.
+        assert await journal.heartbeat(row_id, 'w2') is False
+        await journal.mark_done(row_id)
+        assert await journal.heartbeat(row_id, 'w1') is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_requeue_stale_except_steal_guard(self, journal):
+        my_worker = 'p-me'
+        await journal.enqueue(make_plan(uuid='st-1'))
+        claimed = await journal.claim_next('g1', my_worker)
+        row_id = claimed['id']
+        # Fresh lease: no one steals.
+        assert await journal.requeue_stale_except(my_worker, grace_seconds=1) == 0
+        assert await journal.requeue_stale_except('p-other', grace_seconds=1) == 0
+        # Expire the lease out-of-band.
+        cur = sqlite3.connect(journal.db_path)
+        cur.execute(
+            "UPDATE episode_queue SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (row_id,),
+        )
+        cur.commit()
+        cur.close()
+        # Our own row is never stolen, even when its lease is ancient.
+        assert await journal.requeue_stale_except(my_worker, grace_seconds=1) == 0
+        # A vanished owner's row is reclaimable.
+        assert await journal.requeue_stale_except('p-other', grace_seconds=1) == 1
+        assert await journal.count_pending() == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_processing_stats_window(self, journal):
+        await journal.enqueue(make_plan(uuid='ps-1'))
+        row = await journal.claim_next('g1', 'w1')
+        await journal.mark_done(row['id'])
+        stats = await journal.processing_stats(window_seconds=3600.0)
+        assert stats['processed'] >= 1
+        assert stats['avg_processing_seconds'] >= 0.0
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_migration_adds_requires_serial(self, tmp_path):
+        # A phase-1 journal has no requires_serial column; opening it with the
+        # current QueueJournal must migrate it idempotently and serve claims.
+        db = tmp_path / 'legacy.db'
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            'CREATE TABLE episode_queue ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, dedup_key TEXT NOT NULL, uuid TEXT, '
+            'group_id TEXT NOT NULL, name TEXT NOT NULL, episode_body TEXT NOT NULL, '
+            "plan_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK (status IN ('pending', 'processing', 'done', 'failed')), "
+            'attempt INTEGER NOT NULL DEFAULT 0, worker_id TEXT, lease_until TEXT, '
+            'first_failure_ts TEXT, last_attempt_ts TEXT, next_retry_at TEXT, '
+            'error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)'
+        )
+        conn.commit()
+        conn.close()
+
+        j = QueueJournal(db, lease_seconds=300.0)
+        try:
+            cols = {
+                r[1]
+                for r in sqlite3.connect(db).execute('PRAGMA table_info(episode_queue)')
+            }
+            assert 'requires_serial' in cols
+            # Enqueue + leader/non-leader claim work on the migrated schema.
+            row_id, inserted = await j.enqueue(
+                make_plan(uuid='mig-1', previous_episode_uuids=['u-x'])
+            )
+            assert inserted is True and row_id > 0
+            claimed = await j.claim_next('g1', 'w1', leader=False)
+            assert claimed is not None and claimed['requires_serial'] == 0
+            await j.mark_done(row_id)
+        finally:
+            await j.close()
