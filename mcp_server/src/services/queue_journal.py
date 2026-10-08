@@ -386,8 +386,18 @@ class QueueJournal:
             return int(cur.fetchone()[0])
 
     async def count_unfinished(self) -> int:
-        """Rows that still need work: pending + processing."""
-        return await self.count_pending() + await self.count_processing()
+        """Rows that still need work: pending + processing.
+
+        Single atomic query: splitting it into ``count_pending()`` +
+        ``count_processing()`` could double-count a row claimed between the two
+        reads (backpressure would then over-reject).
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._conn.execute,
+                "SELECT COUNT(*) FROM episode_queue WHERE status IN ('pending', 'processing')",
+            )
+            return int(cur.fetchone()[0])
 
     async def count_pending_group(self, group_id: str) -> int:
         async with self._lock:

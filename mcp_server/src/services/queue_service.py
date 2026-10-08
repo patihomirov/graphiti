@@ -65,8 +65,6 @@ class QueueService:
             )
         # Alarm that wakes group workers when journal rows become due for retry.
         self._journal_retryer: JournalRetryer | None = None
-        # Per-group wake notifications for journal-backed workers (no busy-spin).
-        self._wake_events: dict[str, asyncio.Event] = {}
         # Sync view of journal-backed per-group unfinished counts (legacy API).
         self._journal_queue_sizes: dict[str, int] = {}
         # Rebuilds graphiti.add_episode kwargs from a persisted journal plan.
@@ -76,6 +74,20 @@ class QueueService:
         # How long a journal worker sleeps between no-work wake checks.
         self._journal_idle_timeout = 30.0
 
+        # Global journal worker pool (phase 2). ``journal_workers`` tasks serve
+        # ALL groups: a worker picks a group with due rows, claims exactly one
+        # row under that group's processing lock, then repeats. The per-group
+        # lock keeps within-group processing strictly FIFO and never
+        # parallelizes serial zones.
+        self._pool_tasks: list[asyncio.Task] = []
+        self._pool_started = False
+        self._group_locks: dict[str, asyncio.Lock] = {}
+        # Pool wake primitive: a sticky event + generation counter (a bare
+        # event.clear() lost wakeups under N workers).
+        self._wake_event = asyncio.Event()
+        self._wake_generation = 0
+        self._poll_interval = 0.05
+
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
         # Dictionary to track if a worker is running for each group_id
@@ -83,8 +95,10 @@ class QueueService:
         # Worker task handles per group_id, used to cancel in-flight episodes
         # during a graceful drain.
         self._worker_tasks: dict[str, asyncio.Task] = {}
-        # True while a worker is awaiting its process_func (episode in flight).
-        self._busy: dict[str, bool] = {}
+        # In-flight episode count per group. A counter (not a bool) so
+        # ``_any_busy`` sees every concurrent in-flight episode, even if a
+        # group were ever processed by more than one worker.
+        self._busy_counts: dict[str, int] = {}
         # Flipped by the graceful shutdown coordinator on SIGTERM/SIGINT.
         self._stopping: bool = False
         # Store the graphiti client after initialization
@@ -243,24 +257,17 @@ class QueueService:
         return self._episode_queues[group_id].qsize()
 
     async def _process_episode_queue(self, group_id: str) -> None:
-        """Process episodes for a specific group_id sequentially.
+        """Process episodes for a group sequentially (legacy in-memory mode).
 
-        Journal-backed mode claims rows from the SQLite journal (the source of
-        truth) and waits on a per-group wake event when nothing is due. Legacy
-        mode processes the in-memory queue as before, spooling failures to disk
-        for the background retryer.
+        Journal-backed mode is served by the global worker pool
+        (``_journal_pool_worker``); this loop only ever drains the legacy
+        in-memory queues.
         """
         logger.info(f'Starting episode queue worker for group_id: {group_id}')
         self._queue_workers[group_id] = True
 
         try:
             while True:
-                if self._journal is not None and self._episode_builder is not None:
-                    handled = await self._process_journal_once(group_id)
-                    if handled:
-                        continue
-                    await self._journal_wait(group_id)
-                    continue
                 await self._process_legacy_once(group_id)
         except asyncio.CancelledError:
             logger.info(f'Episode queue worker for group_id {group_id} was cancelled')
@@ -268,9 +275,6 @@ class QueueService:
             logger.error(f'Unexpected error in queue worker for group_id {group_id}: {str(e)}')
         finally:
             self._queue_workers[group_id] = False
-            wake = self._wake_events.get(group_id)
-            if wake is not None:
-                wake.clear()
             logger.info(f'Stopped episode queue worker for group_id: {group_id}')
 
     async def _process_legacy_once(self, group_id: str) -> bool:
@@ -281,7 +285,7 @@ class QueueService:
         try:
             # Mark the worker busy so the graceful drain knows this
             # episode is in flight (not merely pending in the queue).
-            self._busy[group_id] = True
+            self._busy_counts[group_id] = self._busy_counts.get(group_id, 0) + 1
             # Process the episode
             await process_func()
         except asyncio.CancelledError:
@@ -306,7 +310,11 @@ class QueueService:
             if self._breaker is not None:
                 await self._breaker.record_success()
         finally:
-            self._busy[group_id] = False
+            count = self._busy_counts.get(group_id, 0) - 1
+            if count > 0:
+                self._busy_counts[group_id] = count
+            else:
+                self._busy_counts.pop(group_id, None)
             # Decrement the shared depth invariant and mark done regardless
             # of success/failure.
             self._queue_depth = max(0, self._queue_depth - 1)
@@ -319,7 +327,7 @@ class QueueService:
         if row is None:
             return False
 
-        self._busy[group_id] = True
+        self._busy_counts[group_id] = self._busy_counts.get(group_id, 0) + 1
         try:
             plan = json.loads(row['plan_json'])
             if self._episode_builder is None:  # guarded by caller, defensive
@@ -337,38 +345,123 @@ class QueueService:
             if self._breaker is not None:
                 await self._breaker.record_success()
         finally:
-            self._busy[group_id] = False
+            count = self._busy_counts.get(group_id, 0) - 1
+            if count > 0:
+                self._busy_counts[group_id] = count
+            else:
+                self._busy_counts.pop(group_id, None)
             size = await self._journal.count_unfinished_group(group_id)
             self._journal_queue_sizes[group_id] = size
         return True
 
-    async def _journal_wait(self, group_id: str) -> None:
-        """Sleep until a new row is enqueued for the group (or the idle timeout).
+    async def _journal_pool_worker(self) -> None:
+        """Serve journal groups from the global worker pool.
 
-        The event is cleared first and the queue double-checked afterwards so a
-        wake delivered between the last claim and the clear is not lost.
+        A worker picks a group with due rows whose processing lock is free,
+        claims and processes exactly one row under that lock, then repeats. The
+        per-group lock guarantees at most one in-flight episode per group, so
+        within-group order stays strictly FIFO (claim by id) and serial zones
+        (auto-previous context / saga chains / update_communities) are never
+        parallelized - the pool size only adds cross-group concurrency.
         """
-        event = self._wake_events.setdefault(group_id, asyncio.Event())
-        event.clear()
-        if await self._journal.count_unfinished_group(group_id) > 0:
-            return
         try:
-            await asyncio.wait_for(event.wait(), timeout=self._journal_idle_timeout)
-        except asyncio.TimeoutError:
-            return
+            while True:
+                if self._stopping:
+                    return
+                if self._episode_builder is None:
+                    await self._journal_wait_global()
+                    continue
+                group_id = await self._pick_group()
+                if group_id is None:
+                    await self._journal_wait_global()
+                    continue
+                lock = self._group_locks.setdefault(group_id, asyncio.Lock())
+                if not await lock.acquire():
+                    # Another worker holds this group's lock; re-scan the pool.
+                    await self._journal_wait_global()
+                    continue
+                try:
+                    await self._process_journal_once(group_id)
+                finally:
+                    lock.release()
+        except asyncio.CancelledError:
+            logger.info('Journal pool worker cancelled')
+            raise
+        except Exception as e:
+            logger.error('Unexpected error in journal pool worker: %s', e)
+
+    async def _pick_group(self) -> str | None:
+        """Return the first group with due rows whose lock is currently free."""
+        digest = await self._journal.due_digest()
+        for group_id in digest:
+            lock = self._group_locks.get(group_id)
+            if lock is None or not lock.locked():
+                return group_id
+        return None
+
+    async def _has_due_work(self) -> bool:
+        """Whether any group currently has due rows this worker could claim.
+
+        Considers *pending-and-due* rows only, so a worker whose group is
+        mid-flight (row ``processing``) idles instead of hot-polling.
+        """
+        return await self._pick_group() is not None
+
+    async def _journal_wait_global(self) -> None:
+        """Idle a pool worker until the pool is woken or the idle timeout hits.
+
+        The wake event is cleared only after verifying there is no claimable
+        work, with the queue re-checked right after the clear and again after
+        any wake, so a wake that lands mid-wait is never lost (a generation
+        counter pins it). This replaces the old per-group ``_journal_wait``,
+        whose ``event.clear()`` race was unsafe with N workers.
+        """
+        while True:
+            if self._stopping:
+                return
+            if await self._has_due_work():
+                return
+            event = self._wake_event
+            gen = self._wake_generation
+            event.clear()
+            if await self._has_due_work():
+                return
+            try:
+                await asyncio.wait_for(event.wait(), timeout=self._journal_idle_timeout)
+            except asyncio.TimeoutError:
+                return
+            if gen != self._wake_generation:
+                return
+            if await self._has_due_work():
+                return
+            # The event was set by a wake already consumed by another worker and
+            # the generation has not advanced: nothing new is due. Step back
+            # briefly rather than spinning, then re-check from the top.
+            await asyncio.sleep(self._poll_interval)
 
     async def _wake_group(self, group_id: str) -> None:
-        """Notify the group's worker that work may be available (and start one)."""
-        event = self._wake_events.setdefault(group_id, asyncio.Event())
-        event.set()
-        self._ensure_worker(group_id)
+        """Notify the journal worker pool that work may be available."""
+        self._notify_pool()
+        self._ensure_pool()
 
-    def _ensure_worker(self, group_id: str) -> None:
-        """Spawn the group worker if one is not already running."""
-        if not self._queue_workers.get(group_id, False):
-            self._queue_workers[group_id] = True
-            task = asyncio.create_task(self._process_episode_queue(group_id))
-            self._worker_tasks[group_id] = task
+    def _notify_pool(self) -> None:
+        """Wake the journal pool: bump the generation and set the sticky event."""
+        self._wake_generation += 1
+        self._wake_event.set()
+
+    def _ensure_pool(self) -> None:
+        """Start the global journal worker pool (idempotent)."""
+        if self._pool_started or self._journal is None:
+            return
+        self._pool_started = True
+        n = max(1, int(self.resilience.journal_workers))
+        for i in range(1, n + 1):
+            task = asyncio.create_task(
+                self._journal_pool_worker(),
+                name=f'journal-pool-worker-{i}',
+            )
+            self._pool_tasks.append(task)
+        logger.info('Started %d journal pool worker(s)', n)
 
     async def _handle_journal_failure(
         self, group_id: str, row: dict[str, Any], exc: BaseException
@@ -465,7 +558,7 @@ class QueueService:
 
     def _any_busy(self) -> bool:
         """Whether any worker currently has an episode in flight."""
-        return any(self._busy.get(g, False) for g in self._episode_queues)
+        return any(c > 0 for c in self._busy_counts.values())
 
     async def drain(self, wait_current_seconds: float = 7.0) -> dict[str, Any]:
         """Spill every pending episode to the disk spool and drain in-flight work.
@@ -494,11 +587,7 @@ class QueueService:
 
             cancelled_workers: list[asyncio.Task] = []
             if self._any_busy():
-                cancelled_workers = [
-                    task
-                    for group_id, task in self._worker_tasks.items()
-                    if self._busy.get(group_id, False) and not task.done()
-                ]
+                cancelled_workers = [t for t in self._pool_tasks if not t.done()]
                 for task in cancelled_workers:
                     task.cancel()
                 if cancelled_workers:
@@ -554,7 +643,7 @@ class QueueService:
             cancelled_workers = [
                 task
                 for group_id, task in self._worker_tasks.items()
-                if self._busy.get(group_id, False) and not task.done()
+                if self._busy_counts.get(group_id, 0) > 0 and not task.done()
             ]
             for task in cancelled_workers:
                 task.cancel()
@@ -574,7 +663,14 @@ class QueueService:
         }
 
     def is_worker_running(self, group_id: str) -> bool:
-        """Check if a worker is running for a group_id."""
+        """Check if a worker is running for a group_id.
+
+        Journal-backed mode runs the global pool, which serves every group, so
+        this reports whether the pool is up; legacy mode reports the per-group
+        worker flag.
+        """
+        if self._journal is not None:
+            return self._pool_started
         return self._queue_workers.get(group_id, False)
 
     @property
@@ -630,8 +726,10 @@ class QueueService:
             )
             retryer.start()
             self._journal_retryer = retryer
-            # Pick up rows persisted by a previous process (or before workers
-            # existed) without waiting for the first new add_memory.
+            # Start the global worker pool and pick up rows persisted by a
+            # previous process (or before workers existed) without waiting for
+            # the first new add_memory.
+            self._ensure_pool()
             for group_id in await self._journal.distinct_groups_pending():
                 await self._wake_group(group_id)
 
@@ -676,13 +774,20 @@ class QueueService:
         return snapshot
 
     async def close(self) -> None:
-        """Stop the journal alarm and close the journal connection (best-effort)."""
+        """Stop the journal alarm and pool, then close the journal connection."""
         if self._journal_retryer is not None:
             try:
                 await self._journal_retryer.stop()
             except Exception as e:
                 logger.error('Failed to stop journal retryer during shutdown: %s', e)
             self._journal_retryer = None
+        # Cancel pool workers before closing the journal underneath them.
+        if self._pool_tasks:
+            for task in self._pool_tasks:
+                task.cancel()
+            await asyncio.gather(*self._pool_tasks, return_exceptions=True)
+            self._pool_tasks = []
+            self._pool_started = False
         if self._journal is not None:
             try:
                 await self._journal.close()
