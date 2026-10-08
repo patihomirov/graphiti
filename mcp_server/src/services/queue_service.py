@@ -344,11 +344,12 @@ class QueueService:
             if self._episode_builder is None:  # guarded by caller, defensive
                 raise RuntimeError('No episode_builder configured for journal processing')
             kwargs = self._episode_builder(plan)
-            # The pool bounds concurrency per group, but the LLM + graph write is
-            # the scarce resource shared with the direct path: hold the global
-            # semaphore around the actual add_episode call.
-            async with self._llm_semaphore:
-                await self._graphiti_client.add_episode(**kwargs)
+            # Multi-model failover (phase 3, variant 'b'): the whole episode is
+            # processed by a single chosen model; on a transient failure (429 /
+            # empty response / transport) the worker retries the same row inline,
+            # inside this claim, with the next not-yet-attempted fallback model.
+            # The shared LLM semaphore is held around each add_episode call.
+            await self._process_with_failover(row, kwargs)
         except asyncio.CancelledError:
             # The row stays 'processing'; requeue_stale() on the next boot
             # (or a stale-lease cleanup) heals it after the hard kill.
@@ -371,6 +372,127 @@ class QueueService:
             size = await self._journal.count_unfinished_group(group_id)
             self._journal_queue_sizes[group_id] = size
         return True
+
+    async def _process_with_failover(
+        self, row: dict[str, Any], kwargs: dict[str, Any]
+    ) -> None:
+        """Run one claimed journal row, failing over across models on transient errors.
+
+        Implements the worker-level (variant 'b') multi-model design: the ENTIRE
+        episode is processed by a single chosen model so graph extraction stays
+        consistent (never a mix of models inside one episode). When the currently
+        selected model fails transiently (RateLimitError / EmptyResponseError /
+        transport error), the worker retries the SAME row inline — within the
+        same claim, without releasing it and without any circuit-breaker
+        interaction — using the next model from ``resilience.model_fallbacks``
+        that this row has not tried yet (``attempted_models`` journal column).
+
+        The breaker only ever sees the final outcome of the whole chain
+        (record_success / record_failure in the caller), so a failover hop never
+        burns a half-open probe and never trips the breaker on a mid-chain
+        failure (cf. the 680a069 fix). Inline fallback attempts do NOT increment
+        ``attempt``: one logical attempt = one run of the episode, so a 429 storm
+        cannot exhaust ``max_spool_attempts``. When every candidate is exhausted
+        the last exception is re-raised so the standard path (bump_retry +
+        exponential backoff) takes over.
+        """
+        row_id = int(row['id'])
+        llm_client = getattr(self._graphiti_client, 'llm_client', None)
+        setter = self._model_override_setter(llm_client)
+        attempted = self._attempted_from_row(row)
+        candidates = self._failover_candidates(attempted, llm_client)
+
+        last_error: BaseException | None = None
+        for model in candidates:
+            if setter is not None:
+                setter(model)
+            try:
+                # LLM + graph write is the scarce resource shared with the direct
+                # path: hold the global semaphore around the actual call.
+                async with self._llm_semaphore:
+                    await self._graphiti_client.add_episode(**kwargs)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = e
+                # Failover only applies to transient provider trouble AND only
+                # when model switching is actually available (a real llm_client
+                # exposing set_model_override, an known model id). Otherwise the
+                # standard failure path handles the episode unchanged.
+                if not self._failover_eligible(setter, model, e):
+                    raise
+                attempted.append(model)
+                await self._journal.set_attempted_models(row_id, attempted)
+                remaining = len(candidates) - len(attempted)
+                logger.warning(
+                    'Episode %s (name=%s) failed on model %r (%s); %d fallback(s) left',
+                    row.get('uuid'),
+                    row.get('name'),
+                    model,
+                    e,
+                    remaining,
+                )
+            finally:
+                if setter is not None:
+                    setter(None)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError('failover produced no outcome')  # pragma: no cover
+
+    @staticmethod
+    def _attempted_from_row(row: dict[str, Any]) -> list[str]:
+        """Parse the ``attempted_models`` JSON column of a claimed row (anti-loop)."""
+        raw = row.get('attempted_models') or '[]'
+        try:
+            parsed = json.loads(raw)
+            return [str(m) for m in parsed] if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def _failover_candidates(
+        self, attempted: list[str], llm_client: Any
+    ) -> list[str | None]:
+        """Ordered list of models to try for a row: active first, then fallbacks.
+
+        The active model is ``llm_client.model`` (the configured extraction
+        model); ``resilience.model_fallbacks`` are candidates in configured
+        order. Models already in ``attempted`` are skipped (never re-tried within
+        the current attempt chain). If there is no active model, or nothing
+        usable remains, a single ``None`` candidate keeps the standard
+        non-overridden path.
+        """
+        active = getattr(llm_client, 'model', None) if llm_client is not None else None
+        if not active:
+            # No active model -> multi-model failover is meaningless; the
+            # standard non-overridden path handles the episode.
+            return [None]
+        ordered: list[str] = [active]
+        for fallback in self.resilience.model_fallbacks or []:
+            if fallback and fallback not in ordered:
+                ordered.append(fallback)
+        candidates = [m for m in ordered if m not in attempted]
+        if not candidates:
+            candidates = [None]
+        return candidates
+
+    @staticmethod
+    def _model_override_setter(llm_client: Any) -> Callable[[str | None], None] | None:
+        """Return the client's model-override hook, or None when unavailable."""
+        setter = getattr(llm_client, 'set_model_override', None)
+        return setter if callable(setter) else None
+
+    @staticmethod
+    def _failover_eligible(
+        setter: Callable[[str | None], None] | None,
+        model: str | None,
+        exc: BaseException,
+    ) -> bool:
+        """Whether a transient failure on ``model`` may fall over to the next one."""
+        if setter is None or model is None:
+            return False
+        return is_transient_error(exc)
 
     async def _journal_pool_worker(self) -> None:
         """Serve journal groups from the global worker pool.
@@ -857,6 +979,8 @@ class QueueService:
                 **stats,
                 'processed_1h': metrics['processed'],
                 'avg_processing_seconds': metrics['avg_processing_seconds'],
+                # Active multi-model failover list (resilience.model_fallbacks).
+                'fallbacks': list(self.resilience.model_fallbacks),
                 # Raw (not-yet-materialized) episode search is available while
                 # the journal is on; /health surfaces this so clients can gate
                 # the search_raw_episodes tool.
