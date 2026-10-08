@@ -167,3 +167,9 @@ graphiti:
 #   # Global cap on concurrent graphiti.add_episode calls (LLM extraction +
 #   # graph write), shared by the journal pool and the direct add_memory path.
 #   semaphore_limit: 10
+#   # Lease steward: how often to reclaim processing rows whose owner vanished,
+#   # and how far past an expired lease a row must be before another worker may
+#   # take it. Rows owned by the live process are never stolen, so long in-flight
+#   # LLM calls are never double-processed.
+#   journal_steward_interval_seconds: 15
+#   journal_grace_seconds: 60

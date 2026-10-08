@@ -341,6 +341,19 @@ class ResilienceConfig(BaseModel):
         'extraction + graph write). Shared by the journal worker pool and the direct '
         'add_memory path via the server-wide semaphore.',
     )
+    journal_steward_interval_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        description='Interval at which the lease steward scans for processing rows '
+        'whose owner vanished. The steal guard never touches rows owned by the '
+        'current worker, so long in-flight LLM calls are never double-processed.',
+    )
+    journal_grace_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        description='How far past an expired lease a processing row must be before '
+        'another worker may reclaim it.',
+    )
 
 
 class GraphitiConfig(BaseSettings):

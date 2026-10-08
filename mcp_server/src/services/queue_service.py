@@ -1,6 +1,7 @@
 """Queue service for managing episode processing."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -91,6 +92,9 @@ class QueueService:
         # with the server-wide semaphore so the pool and the direct path share
         # one LLM concurrency limit.
         self._llm_semaphore = asyncio.Semaphore(int(self.resilience.semaphore_limit))
+        # Periodic lease steward (phase 2): requeues rows whose owner vanished,
+        # while never stealing this process's own in-flight rows.
+        self._steward_task: asyncio.Task | None = None
 
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
@@ -332,6 +336,9 @@ class QueueService:
             return False
 
         self._busy_counts[group_id] = self._busy_counts.get(group_id, 0) + 1
+        # Keep the lease fresh for long in-flight LLM calls so the steward never
+        # steals our own row; cancelled in ``finally`` once the row is done.
+        heartbeat = asyncio.create_task(self._journal_heartbeat_loop(row['id']))
         try:
             plan = json.loads(row['plan_json'])
             if self._episode_builder is None:  # guarded by caller, defensive
@@ -353,6 +360,9 @@ class QueueService:
             if self._breaker is not None:
                 await self._breaker.record_success()
         finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
             count = self._busy_counts.get(group_id, 0) - 1
             if count > 0:
                 self._busy_counts[group_id] = count
@@ -451,6 +461,56 @@ class QueueService:
         """Notify the journal worker pool that work may be available."""
         self._notify_pool()
         self._ensure_pool()
+
+    async def _journal_heartbeat_loop(self, row_id: int) -> None:
+        """Renew a claimed row's lease while its add_episode is in flight.
+
+        Runs as a side task per in-flight row and is cancelled once the row is
+        finished; the lease outlives a long LLM call, so the steward cannot
+        reclaim it and no two workers process the same episode.
+        """
+        interval = max(0.1, self._journal.lease_seconds / 2.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                alive = await self._journal.heartbeat(row_id, self._worker_id)
+                if not alive:
+                    logger.warning(
+                        'Lease lost on journal row %s (worker %s); stopping heartbeat',
+                        row_id,
+                        self._worker_id,
+                    )
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _journal_steward(self) -> None:
+        """Periodically requeue processing rows whose owner vanished.
+
+        Uses ``requeue_stale_except`` so rows owned by this process are never
+        stolen - long in-flight LLM calls are not double-processed; a vanished
+        owner's rows (lease expired beyond ``journal_grace_seconds``) are moved
+        back to pending and the pool is woken to retry them.
+        """
+        interval = max(1.0, float(self.resilience.journal_steward_interval_seconds))
+        while True:
+            if self._stopping:
+                return
+            await asyncio.sleep(interval)
+            try:
+                stolen = await self._journal.requeue_stale_except(
+                    self._worker_id, self.resilience.journal_grace_seconds
+                )
+                if stolen:
+                    logger.warning(
+                        'Lease steward requeued %d row(s) whose owner vanished',
+                        stolen,
+                    )
+                    self._notify_pool()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error('Lease steward error: %s', e)
 
     def _notify_pool(self) -> None:
         """Wake the journal pool: bump the generation and set the sticky event."""
@@ -747,6 +807,8 @@ class QueueService:
             self._ensure_pool()
             for group_id in await self._journal.distinct_groups_pending():
                 await self._wake_group(group_id)
+            # Lease steward: periodically reclaim rows whose owner vanished.
+            self._steward_task = asyncio.create_task(self._journal_steward())
 
         logger.info('Queue service initialized with graphiti client')
 
@@ -796,6 +858,12 @@ class QueueService:
             except Exception as e:
                 logger.error('Failed to stop journal retryer during shutdown: %s', e)
             self._journal_retryer = None
+        # Stop the lease steward before canceling the pool that might feed it.
+        if self._steward_task is not None:
+            self._steward_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._steward_task
+            self._steward_task = None
         # Cancel pool workers before closing the journal underneath them.
         if self._pool_tasks:
             for task in self._pool_tasks:

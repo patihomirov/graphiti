@@ -419,6 +419,48 @@ class QueueJournal:
             )
             return cur.rowcount
 
+    async def heartbeat(self, row_id: int, worker_id: str) -> bool:
+        """Renew the lease on a row owned by ``worker_id`` (long LLM calls).
+
+        Returns ``False`` when the row no longer belongs to this worker (it was
+        reclaimed, deleted, or finished), in which case the caller must stop
+        heartbeating.
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync,
+                self._conn,
+                "UPDATE episode_queue SET lease_until=?, updated_at=? "
+                "WHERE id=? AND worker_id=? AND status='processing'",
+                (_later_iso(self.lease_seconds), _now_iso(), row_id, worker_id),
+            )
+            return cur.rowcount > 0
+
+    async def requeue_stale_except(self, worker_id: str, grace_seconds: float) -> int:
+        """Requeue processing rows whose owner vanished, never stealing our own.
+
+        Only rows whose lease expired more than ``grace_seconds`` ago AND that
+        are owned by a different worker (or none) are taken back to ``pending``.
+        The current worker's rows are never stolen - even after their lease - so
+        a long in-flight LLM call on this process can never be double-processed;
+        such rows are healed by ``requeue_stale()`` on the next boot instead.
+        """
+        cutoff = _later_iso(-grace_seconds)
+        sql = (
+            'UPDATE episode_queue SET status=\'pending\', worker_id=NULL, '
+            'lease_until=NULL, error=\'requeued stale claim\', updated_at=? '
+            "WHERE status='processing' AND (lease_until IS NULL OR lease_until <= ?) "
+            'AND (worker_id IS NULL OR worker_id <> ?)'
+        )
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync,
+                self._conn,
+                sql,
+                (_now_iso(), cutoff, worker_id),
+            )
+            return cur.rowcount
+
     # ------------------------------------------------------------- counts
 
     async def count_pending(self) -> int:
