@@ -118,4 +118,10 @@ class GracefulShutdownCoordinator:
                 await self.retryer.stop()
             except Exception as e:
                 logger.error('Failed to stop episode retryer during shutdown: %s', e)
+        # Best-effort close of the journal-backed queue service: stop the journal
+        # alarm and close the journal connection (durable rows survive anyway).
+        try:
+            await self.queue_service.close()
+        except Exception as e:
+            logger.error('Failed to close queue service during shutdown: %s', e)
         return result
