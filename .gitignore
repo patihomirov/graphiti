@@ -168,3 +168,6 @@ cache.db*
 .DS_Store
 # Resilience: disk spool of failed episode writes (may contain private episode content)
 spool/
+# Resilience: durable SQLite write-ahead journal (may contain private episode content)
+journal.db*
+~/.graphiti/journal.db*
