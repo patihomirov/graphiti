@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -87,9 +88,38 @@ class LLMClient(ABC):
         self.tracer: Tracer = NoOpTracer()
         self.token_tracker: TokenUsageTracker = TokenUsageTracker()
 
+        # Multi-model failover hook (mcp_server journal worker, Phase 3): a
+        # per-task context var pining the model to use for the current episode.
+        # A context var (not a plain attribute) keeps the override isolated per
+        # asyncio task, so parallel journal workers never clobber each other's
+        # choice while still sharing the one client instance.
+        self._model_override: contextvars.ContextVar[str | None] = (
+            contextvars.ContextVar(f'llm_model_override_{id(self)}', default=None)
+        )
+
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
             self.cache_dir = LLMCache(DEFAULT_CACHE_DIR)
+
+    @property
+    def model_override(self) -> str | None:
+        """The model pinned for the current asyncio task, if any.
+
+        Used by the journal worker's multi-model failover: the worker sets the
+        override for the duration of one episode so ALL sub-calls of that episode
+        (extract_nodes, edges, attributes, dedup) go to the SAME model, keeping
+        the extracted graph consistent across the episode.
+        """
+        return self._model_override.get()
+
+    def set_model_override(self, model: str | None) -> None:
+        """Pin the LLM model for the current asyncio task (None = use config model).
+
+        ``None`` restores the configured ``self.model``. Raising it inside a
+        journal worker only affects that worker's task context; the value is
+        automatically discarded when the task ends.
+        """
+        self._model_override.set(model)
 
     def set_tracer(self, tracer: Tracer) -> None:
         """Set the tracer for this LLM client."""

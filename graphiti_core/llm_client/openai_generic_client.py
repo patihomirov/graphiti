@@ -153,7 +153,7 @@ class OpenAIGenericClient(LLMClient):
                 openai_messages.append({'role': 'system', 'content': m.content})
         try:
             response = await self.client.chat.completions.create(
-                model=self.model or DEFAULT_MODEL,
+                model=self.model_override or self.model or DEFAULT_MODEL,
                 messages=openai_messages,
                 temperature=self.temperature,
                 max_tokens=max_tokens,
