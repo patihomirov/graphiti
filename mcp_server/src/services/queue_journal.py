@@ -456,6 +456,30 @@ class QueueJournal:
             'total': pending + processing + failed + done,
         }
 
+    async def processing_stats(self, window_seconds: float = 3600.0) -> dict[str, float | int]:
+        """Aggregate timing stats over ``done`` rows updated within the window.
+
+        Returns ``{'processed': int, 'avg_processing_seconds': float}`` - the
+        number of rows finished inside the window and their average wall-clock
+        processing time (``updated_at - created_at``). Pure SELECTs over the
+        existing ``created_at``/``updated_at`` columns (no breaker/spool
+        involvement), used by ``/health`` and the parallel-drain bench.
+        """
+        window_start = _later_iso(-window_seconds)
+        sql = (
+            "SELECT COUNT(*) AS processed, "
+            "COALESCE(AVG(julianday(updated_at) - julianday(created_at)) * 86400.0, 0.0) "
+            'AS avg_seconds '
+            "FROM episode_queue WHERE status = 'done' AND updated_at >= ?"
+        )
+        async with self._lock:
+            cur = await asyncio.to_thread(self._conn.execute, sql, (window_start,))
+            row = cur.fetchone()
+        return {
+            'processed': int(row['processed']),
+            'avg_processing_seconds': round(float(row['avg_seconds']), 3),
+        }
+
     async def cleanup_done(self, retention_seconds: float = 7 * 24 * 3600) -> int:
         """Delete rows that are ``done`` and older than the retention window."""
         cutoff = _later_iso(-retention_seconds)

@@ -658,12 +658,15 @@ class QueueService:
 
         if self._journal is not None:
             stats = await self._journal.stats()
+            metrics = await self._journal.processing_stats(window_seconds=3600.0)
             snapshot['queue_depth'] = stats['unfinished']
             snapshot['pending_episodes'] = stats['pending']
             snapshot['journal'] = {
                 'enabled': True,
                 'path': str(self._journal.db_path),
                 **stats,
+                'processed_1h': metrics['processed'],
+                'avg_processing_seconds': metrics['avg_processing_seconds'],
             }
         else:
             snapshot['queue_depth'] = self._queue_depth

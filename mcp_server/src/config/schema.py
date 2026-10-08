@@ -326,6 +326,14 @@ class ResilienceConfig(BaseModel):
         'whose lease_until has passed is considered stale and requeued on startup '
         '(heals hard-killed in-flight episodes).',
     )
+    journal_workers: int = Field(
+        default=1,
+        ge=1,
+        description='Size of the global journal worker pool. Workers claim rows from '
+        'any group; a per-group processing lock keeps each group strictly FIFO, so the '
+        'pool size bounds cross-group concurrency without ever parallelizing within a '
+        'group (which would break previous-episode context ordering).',
+    )
 
 
 class GraphitiConfig(BaseSettings):
