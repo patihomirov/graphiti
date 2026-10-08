@@ -308,6 +308,24 @@ class ResilienceConfig(BaseModel):
     max_spool_attempts: int = Field(
         default=10, description='Max retry attempts before an episode is moved to failed/'
     )
+    journal_enabled: bool = Field(
+        default=False,
+        description='Enable the durable SQLite write-ahead journal as the source of truth '
+        'for the episode write path. When enabled, every episode plan is written to the '
+        'journal DB before processing and workers claim rows from it, so episodes survive '
+        'hard kills (SIGKILL) instead of being lost with the in-memory queue.',
+    )
+    journal_path: str | None = Field(
+        default=None,
+        description='Path to the SQLite journal DB. Defaults to ~/.graphiti/journal.db '
+        'when journal_enabled.',
+    )
+    journal_lease_seconds: float = Field(
+        default=300.0,
+        description='Worker lease duration for claimed journal rows. A processing row '
+        'whose lease_until has passed is considered stale and requeued on startup '
+        '(heals hard-killed in-flight episodes).',
+    )
 
 
 class GraphitiConfig(BaseSettings):

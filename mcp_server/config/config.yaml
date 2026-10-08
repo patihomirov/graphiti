@@ -151,3 +151,10 @@ graphiti:
 #   retryer_interval_seconds: 15
 #   spool_backoff_base_seconds: 30
 #   max_spool_attempts: 10
+#   # Durable SQLite write-ahead journal: when enabled, add_memory first writes
+#   # each episode plan to the journal DB (WAL) and workers claim rows from it,
+#   # so queued episodes survive a hard kill (SIGKILL) without loss. Backpressure
+#   # and /health counts are read from journal rows, correct after a restart.
+#   journal_enabled: true
+#   journal_path: "~/.graphiti/journal.db"   # contains private episode content - keep ignored
+#   journal_lease_seconds: 300.0
