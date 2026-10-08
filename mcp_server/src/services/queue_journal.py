@@ -61,6 +61,7 @@ _ROW_COLUMNS = (
     'next_retry_at',
     'error',
     'requires_serial',
+    'attempted_models',
     'created_at',
     'updated_at',
 )
@@ -197,6 +198,13 @@ class QueueJournal:
             self._conn.execute(
                 'ALTER TABLE episode_queue '
                 'ADD COLUMN requires_serial INTEGER NOT NULL DEFAULT 0'
+            )
+        if 'attempted_models' not in existing:
+            # Multi-model failover (phase 3): JSON list of model IDs already tried
+            # for this row (anti-loop guard). Rows created before the column
+            # existed simply have none attempted.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN attempted_models TEXT'
             )
         # Created here (after any ALTER) so it is valid on both fresh and
         # migrated journals; an early CREATE with the missing column would fail.
@@ -399,13 +407,42 @@ class QueueJournal:
         error: str,
         next_retry_at: str,
     ) -> None:
-        """Keep a failed row pending for a later retry (exponential backoff)."""
+        """Keep a failed row pending for a later retry (exponential backoff).
+
+        ``attempted_models`` is reset to NULL here: a backoff interval is the
+        release point for the 429 storm, so the next claim restarts from the
+        active model instead of replaying the previously failed chain.
+        """
         await self._execute(
             "UPDATE episode_queue SET status='pending', attempt=?, error=?, "
-            "next_retry_at=?, worker_id=NULL, lease_until=NULL, "
+            "next_retry_at=?, worker_id=NULL, lease_until=NULL, attempted_models=NULL, "
             "first_failure_ts=COALESCE(first_failure_ts, ?), last_attempt_ts=?, updated_at=? "
             'WHERE id=?',
             (attempt, error, next_retry_at, _now_iso(), _now_iso(), _now_iso(), row_id),
+        )
+
+    async def get_attempted_models(self, row_id: int) -> list[str]:
+        """Return the model IDs already attempted for a row (JSON column)."""
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._conn.execute,
+                'SELECT attempted_models FROM episode_queue WHERE id=?',
+                (row_id,),
+            )
+            row = cur.fetchone()
+        if row is None or not row['attempted_models']:
+            return []
+        try:
+            parsed = json.loads(row['attempted_models'])
+            return [str(m) for m in parsed] if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    async def set_attempted_models(self, row_id: int, models: list[str]) -> None:
+        """Persist the full set of model IDs attempted for a row."""
+        await self._execute(
+            'UPDATE episode_queue SET attempted_models=?, updated_at=? WHERE id=?',
+            (json.dumps(models, ensure_ascii=False), _now_iso(), row_id),
         )
 
     async def mark_failed(self, row_id: int, error: str) -> None:
