@@ -354,6 +354,16 @@ class ResilienceConfig(BaseModel):
         description='How far past an expired lease a processing row must be before '
         'another worker may reclaim it.',
     )
+    model_fallbacks: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Ordered fallback LLM models (gateway model IDs) tried by the journal '
+            'worker when the active extraction model (llm.model) fails transiently '
+            '(RateLimitError / EmptyResponseError / transport error). Order matters: '
+            'the first not-yet-attempted model wins. Fallbacks use the same '
+            'max_tokens as llm.max_tokens. Empty list = failover off.'
+        ),
+    )
 
 
 class GraphitiConfig(BaseSettings):

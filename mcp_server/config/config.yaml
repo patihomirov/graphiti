@@ -173,3 +173,13 @@ graphiti:
 #   # LLM calls are never double-processed.
 #   journal_steward_interval_seconds: 15
 #   journal_grace_seconds: 60
+#   # Multi-model failover (phase 3): ordered fallback LLM models (gateway IDs)
+#   # tried by the journal worker when the active extraction model (llm.model)
+#   # fails transiently for an episode (RateLimitError / empty response / 5xx).
+#   # The whole episode is processed by ONE chosen model (graph consistency);
+#   # fallbacks use the same max_tokens as llm.max_tokens. Order matters: the
+#   # first not-yet-attempted model wins. An empty list disables failover.
+#   # Cutover requires canary trials of the candidate on real long episodes
+#   # (see ~/docs/research/graphiti-model-failover*.md).
+#   model_fallbacks:
+#     - "AgentLLM-default"
