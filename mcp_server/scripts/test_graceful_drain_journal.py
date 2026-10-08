@@ -136,10 +136,10 @@ def main() -> int:
         failed += 0 if ok else 1
         print(f'  [{status}] {name} ({detail})')
 
-    print(f'\n== serve log tail ==')
+    print('\n== serve log tail ==')
     for line in serve_log.read_text(encoding='utf-8').splitlines()[-10:]:
         print('  ' + line)
-    print(f'\n== replay log tail ==')
+    print('\n== replay log tail ==')
     for line in (workdir / 'replay.log').read_text(encoding='utf-8').splitlines()[-10:]:
         print('  ' + line)
 

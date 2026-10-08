@@ -16,14 +16,16 @@ No LLM and no Neo4j are touched: the graphiti client is faked out entirely.
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
-from config.schema import ResilienceConfig  # noqa: E402
 from graphiti_core.nodes import EpisodeType  # noqa: E402
+
+from config.schema import ResilienceConfig  # noqa: E402
 from services.queue_service import QueueService  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -111,7 +113,7 @@ async def run_serve(args: argparse.Namespace) -> int:
 
     uvicorn_config = uvicorn.Config(dummy_app, host='127.0.0.1', port=0, log_level='warning')
     server = uvicorn.Server(uvicorn_config)
-    serve_task = asyncio.create_task(server.serve(), name='fixture-http-server')
+    asyncio.create_task(server.serve(), name='fixture-http-server')
 
     # Enqueue 3 fake episodes: the worker picks the first one up immediately
     # (SlowClient hangs on it), episodes two and three stay pending.
@@ -131,10 +133,8 @@ async def run_serve(args: argparse.Namespace) -> int:
     Path(args.ready_file).write_text('ready\n', encoding='utf-8')
 
     # Idle forever; the test SIGKILLs this process (no graceful drain path).
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.Event().wait()
-    except asyncio.CancelledError:
-        pass
     await queue_service.close()
     return 0
 

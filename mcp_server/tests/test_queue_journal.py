@@ -10,11 +10,9 @@ against a tmp_path SQLite DB with no network and no graphiti-core data.
 import asyncio
 import json
 import sqlite3
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-
 from graphiti_core import Graphiti
 
 from config.schema import ResilienceConfig

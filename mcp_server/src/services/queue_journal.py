@@ -31,6 +31,7 @@ asyncio-safety: ``check_same_thread=False`` plus a single ``asyncio.Lock`` and
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -145,10 +146,8 @@ class QueueJournal:
             self._has_returning = sqlite3.sqlite_version_info >= (3, 35)
         except Exception:
             # Fail-closed (D5): do not leak a half-open connection.
-            try:
+            with contextlib.suppress(Exception):
                 self._conn.close()  # type: ignore[has-type]
-            except Exception:
-                pass
             raise
         logger.info('SQLite journal ready: %s (lease=%ss)', self.db_path, self.lease_seconds)
 
@@ -499,10 +498,8 @@ class JournalRetryer:
     async def stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
 
     async def _run(self) -> None:
