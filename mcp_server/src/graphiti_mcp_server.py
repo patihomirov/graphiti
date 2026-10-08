@@ -1374,7 +1374,9 @@ async def initialize_server() -> ServerConfig:
     # Initialize queue service with the client. The episode_builder rebuilds
     # graphiti.add_episode kwargs from a persisted plan (complex structures are
     # not persisted and are rebuilt from the live service), and is shared by the
-    # journal-backed workers and the legacy spool retryer.
+    # journal-backed workers and the legacy spool retryer. The server-wide
+    # semaphore bounds concurrent add_episode across both the journal pool and
+    # the direct path.
     episode_builder = None
 
     def _build_episode_builder():
@@ -1405,7 +1407,9 @@ async def initialize_server() -> ServerConfig:
     if config.resilience.enabled:
         episode_builder = _build_episode_builder()
 
-    await queue_service.initialize(graphiti_client, episode_builder=episode_builder)
+    await queue_service.initialize(
+        graphiti_client, episode_builder=episode_builder, llm_semaphore=semaphore
+    )
 
     if queue_service.journal is not None:
         logger.info(

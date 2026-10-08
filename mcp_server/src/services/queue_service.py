@@ -87,6 +87,10 @@ class QueueService:
         self._wake_event = asyncio.Event()
         self._wake_generation = 0
         self._poll_interval = 0.05
+        # Global cap on concurrent add_episode calls. initialize() may replace it
+        # with the server-wide semaphore so the pool and the direct path share
+        # one LLM concurrency limit.
+        self._llm_semaphore = asyncio.Semaphore(int(self.resilience.semaphore_limit))
 
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
@@ -333,7 +337,11 @@ class QueueService:
             if self._episode_builder is None:  # guarded by caller, defensive
                 raise RuntimeError('No episode_builder configured for journal processing')
             kwargs = self._episode_builder(plan)
-            await self._graphiti_client.add_episode(**kwargs)
+            # The pool bounds concurrency per group, but the LLM + graph write is
+            # the scarce resource shared with the direct path: hold the global
+            # semaphore around the actual add_episode call.
+            async with self._llm_semaphore:
+                await self._graphiti_client.add_episode(**kwargs)
         except asyncio.CancelledError:
             # The row stays 'processing'; requeue_stale() on the next boot
             # (or a stale-lease cleanup) heals it after the hard kill.
@@ -692,6 +700,7 @@ class QueueService:
         self,
         graphiti_client: Any,
         episode_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        llm_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         """Initialize the queue service with a graphiti client.
 
@@ -700,9 +709,15 @@ class QueueService:
             episode_builder: Rebuilds graphiti.add_episode kwargs from a persisted
                 journal plan. Required for journal-backed processing; set only when
                 resilience is enabled.
+            llm_semaphore: Optional shared cap on concurrent add_episode calls. When
+                omitted, a private semaphore sized from ``resilience.semaphore_limit``
+                is used; pass the server-wide semaphore so the journal pool and the
+                direct path share one LLM concurrency limit.
         """
         self._graphiti_client = graphiti_client
         self._episode_builder = episode_builder
+        if llm_semaphore is not None:
+            self._llm_semaphore = llm_semaphore
 
         if self._journal is not None:
             if self._episode_builder is None:

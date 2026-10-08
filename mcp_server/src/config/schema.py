@@ -334,6 +334,13 @@ class ResilienceConfig(BaseModel):
         'pool size bounds cross-group concurrency without ever parallelizing within a '
         'group (which would break previous-episode context ordering).',
     )
+    semaphore_limit: int = Field(
+        default=10,
+        ge=1,
+        description='Global cap on concurrent graphiti.add_episode calls (the LLM '
+        'extraction + graph write). Shared by the journal worker pool and the direct '
+        'add_memory path via the server-wide semaphore.',
+    )
 
 
 class GraphitiConfig(BaseSettings):

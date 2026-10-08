@@ -158,3 +158,12 @@ graphiti:
 #   journal_enabled: true
 #   journal_path: "~/.graphiti/journal.db"   # contains private episode content - keep ignored
 #   journal_lease_seconds: 300.0
+#   # Global journal worker pool size (phase 2): workers may claim from any
+#   # group, but a per-group lock keeps each group strictly FIFO, so this only
+#   # adds cross-group concurrency. Serial zones (no previous_episode_uuids,
+#   # saga without saga_previous_episode_uuid, update_communities) are never
+#   # parallelized.
+#   journal_workers: 4
+#   # Global cap on concurrent graphiti.add_episode calls (LLM extraction +
+#   # graph write), shared by the journal pool and the direct add_memory path.
+#   semaphore_limit: 10
