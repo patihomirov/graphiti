@@ -596,3 +596,147 @@ class TestSerialPolicyAndLease:
             await j.mark_done(row_id)
         finally:
             await j.close()
+
+
+class TestSearchRaw:
+    """Mini-phase A: raw-episode search over the journal (visibility of
+    not-yet-materialized episodes). An episode must be findable right after
+    enqueue, regardless of extraction."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_finds_by_name(self, journal):
+        await journal.enqueue(
+            make_plan(uuid='sr-name', name='Alpha ingress report', episode_body='body one')
+        )
+        await journal.enqueue(
+            make_plan(uuid='sr-other', name='beta doc', episode_body='unrelated')
+        )
+        hits = await journal.search_raw('alpha')
+        assert len(hits) == 1
+        assert hits[0]['name'] == 'Alpha ingress report'
+        assert hits[0]['status'] == 'pending'
+        assert hits[0]['group_id'] == 'g1'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_finds_by_body_case_insensitive(self, journal):
+        await journal.enqueue(
+            make_plan(uuid='sr-b1', name='n-one', episode_body='The QUICK brown fox')
+        )
+        await journal.enqueue(
+            make_plan(uuid='sr-b2', name='n-two', episode_body='lazy dog')
+        )
+        hits = await journal.search_raw('quick')
+        assert len(hits) == 1
+        assert hits[0]['name'] == 'n-one'
+        assert hits[0]['snippet'] == 'The QUICK brown fox'
+        # Case-insensitive in both directions (stored value and query).
+        hits = await journal.search_raw('QUICK')
+        assert len(hits) == 1 and hits[0]['name'] == 'n-one'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_entry_shape_and_materialized_flag(self, journal):
+        await journal.enqueue(
+            make_plan(uuid='sr-k', name='keys', episode_body='x' * 300)
+        )
+        hits = await journal.search_raw('keys')
+        assert len(hits) == 1
+        entry = hits[0]
+        assert {
+            'id', 'status', 'group_id', 'name', 'snippet',
+            'created_at', 'updated_at', 'materialized',
+        } <= set(entry)
+        assert entry['materialized'] is False
+        # Snippet is capped to the first ~200 characters of episode_body.
+        assert entry['snippet'] == 'x' * 200
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_escapes_wildcards(self, journal):
+        await journal.enqueue(
+            make_plan(uuid='sr-w1', name='100% profit plan', episode_body='plain')
+        )
+        await journal.enqueue(
+            make_plan(uuid='sr-w2', name='plain document', episode_body='plain')
+        )
+        await journal.enqueue(
+            make_plan(uuid='sr-w3', name='under_score_note', episode_body='plain')
+        )
+        # '%' must be a literal, not a wildcard: only the row that literally
+        # contains '100%' matches.
+        hits = await journal.search_raw('100%')
+        assert [h['name'] for h in hits] == ['100% profit plan']
+        # '_' must be a literal, not a single-char wildcard.
+        hits = await journal.search_raw('under_')
+        assert [h['name'] for h in hits] == ['under_score_note']
+        # A bare '%' query must not match every row: escaping turns it into a
+        # literal '%', so only rows that literally contain one match.
+        hits = await journal.search_raw('%')
+        assert [h['name'] for h in hits] == ['100% profit plan']
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_excludes_done_unless_include_done(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='sr-d1', name='done name', episode_body='body')
+        )
+        await journal.mark_done(row_id)
+        await journal.enqueue(
+            make_plan(uuid='sr-d2', name='pending name', episode_body='body')
+        )
+        # Done rows are hidden by default.
+        hits = await journal.search_raw('name')
+        assert [h['name'] for h in hits] == ['pending name']
+        # ... and included with include_done=True.
+        hits = await journal.search_raw('name', include_done=True)
+        assert {h['name'] for h in hits} == {'done name', 'pending name'}
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_includes_failed_and_processing(self, journal):
+        failed_id, _ = await journal.enqueue(
+            make_plan(uuid='sr-f1', name='failed row', episode_body='body')
+        )
+        await journal.mark_failed(failed_id, 'boom')
+        await journal.enqueue(
+            make_plan(uuid='sr-p1', name='processing row', episode_body='body')
+        )
+        await journal.claim_next('g1', 'w')  # claims the pending row -> processing
+        hits = await journal.search_raw('row')
+        assert {h['name'] for h in hits} == {'failed row', 'processing row'}
+        assert {h['status'] for h in hits} == {'failed', 'processing'}
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_respects_limit_and_newest_first(self, journal):
+        for i in range(5):
+            await journal.enqueue(
+                make_plan(uuid=f'sr-l{i}', name='limit match', episode_body='x')
+            )
+        hits = await journal.search_raw('limit match', limit=2)
+        assert len(hits) == 2
+        assert hits[0]['id'] > hits[1]['id']
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_search_empty_query_and_bad_limit(self, journal):
+        await journal.enqueue(
+            make_plan(uuid='sr-e1', name='some ep', episode_body='body')
+        )
+        assert await journal.search_raw('') == []
+        assert await journal.search_raw('   ') == []
+        assert await journal.search_raw('some ep', limit=0) == []
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_queue_service_journal_search_raw_empty_when_journal_off(self):
+        # MCP-level: with the journal disabled (default config) the read path
+        # returns [] instead of raising, so search_raw_episodes never breaks a
+        # journal-off server.
+        service = QueueService(ResilienceConfig(journal_enabled=False, spool_enabled=False))
+        try:
+            assert await service.journal_search_raw('anything') == []
+        finally:
+            await service.close()

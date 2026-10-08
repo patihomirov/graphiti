@@ -165,6 +165,10 @@ Core tools:
 - build_communities: detect entity communities and produce higher-level community summaries.
 - get_episode_entities: trace provenance — the entities and facts created by specific episode UUIDs.
 - get_entity_edge / get_episodes: retrieve specific facts or episodes.
+- search_raw_episodes: search the durable write-ahead journal for raw,
+  not-yet-materialized episodes (visible immediately after add_memory is
+  accepted, before background extraction finishes) - available when the
+  resilience journal is enabled.
 - delete_episode: remove an episode and cascade-delete the entities/facts it solely created.
 - delete_entity_edge / clear_graph: remove a fact, or clear a group's data.
 
@@ -910,6 +914,71 @@ async def get_episodes(
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
         return ErrorResponse(error=f'Error getting episodes: {error_msg}')
+
+
+@mcp.tool()
+async def search_raw_episodes(
+    query: str,
+    limit: int = 20,
+    include_done: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Search raw, not-yet-materialized episodes in the durable write-ahead journal.
+
+    An episode is visible here immediately after ``add_memory`` was accepted -
+    before the background extraction has written it into the graph - so parsing
+    is never a blocker for finding a submitted episode. Matching is
+    case-insensitive over the episode name and body (LIKE; user wildcards are
+    escaped). Rows come back newest-first; ``done`` entries are excluded unless
+    ``include_done`` is true. Every result carries ``materialized: False`` - the
+    journal is not the graph.
+
+    Only available when the resilience journal is enabled. When it is disabled
+    the tool returns a structured ``{type, error, message, entries}`` response
+    (never crashes the server).
+
+    Args:
+        query: Substring to match against an episode's name or body.
+        limit: Maximum number of entries to return (default: 20).
+        include_done: When True, finished episodes are searched too.
+
+    Returns:
+        A list of ``{id, status, group_id, name, snippet, created_at, updated_at,
+        materialized}`` dicts, or a structured error dict when the journal is off.
+    """
+    global queue_service
+
+    if queue_service is None:
+        return {
+            'type': 'search_raw_episodes',
+            'error': 'Services not initialized',
+            'entries': [],
+        }
+
+    # Raw search reads the durable journal; without it there is nothing to
+    # search and the tool degrades gracefully instead of failing.
+    if queue_service.journal is None:
+        return {
+            'type': 'search_raw_episodes',
+            'error': 'journal disabled',
+            'message': (
+                'Raw episode search unavailable: the durable SQLite journal is '
+                'disabled (set resilience.journal_enabled to enable it)'
+            ),
+            'entries': [],
+        }
+
+    try:
+        return await queue_service.journal_search_raw(
+            query, limit=limit, include_done=include_done
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error searching raw episodes: {error_msg}')
+        return {
+            'type': 'search_raw_episodes',
+            'error': f'Error searching raw episodes: {error_msg}',
+            'entries': [],
+        }
 
 
 @mcp.tool()

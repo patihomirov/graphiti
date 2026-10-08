@@ -756,6 +756,21 @@ class QueueService:
         """The durable SQLite journal backing the write path, if enabled."""
         return self._journal
 
+    async def journal_search_raw(
+        self, query: str, *, limit: int = 20, include_done: bool = False
+    ) -> list[dict[str, Any]]:
+        """Search raw (not-yet-materialized) journal episodes by name/body.
+
+        Backs the ``search_raw_episodes`` MCP tool. Returns ``[]`` when the
+        journal is disabled - there is nothing to search - instead of raising,
+        so the read path never breaks a journal-off server.
+        """
+        if self._journal is None:
+            return []
+        return await self._journal.search_raw(
+            query, limit=limit, include_done=include_done
+        )
+
     async def initialize(
         self,
         graphiti_client: Any,
@@ -842,11 +857,15 @@ class QueueService:
                 **stats,
                 'processed_1h': metrics['processed'],
                 'avg_processing_seconds': metrics['avg_processing_seconds'],
+                # Raw (not-yet-materialized) episode search is available while
+                # the journal is on; /health surfaces this so clients can gate
+                # the search_raw_episodes tool.
+                'search': True,
             }
         else:
             snapshot['queue_depth'] = self._queue_depth
             snapshot['pending_episodes'] = self._spool.count_pending() if self._spool is not None else 0
-            snapshot['journal'] = {'enabled': False}
+            snapshot['journal'] = {'enabled': False, 'search': False}
         snapshot['stopping'] = self._stopping
         return snapshot
 

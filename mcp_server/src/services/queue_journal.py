@@ -125,6 +125,18 @@ def compute_dedup_key(plan: dict[str, Any]) -> str:
     return f'sha256:{digest}'
 
 
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so user input is treated as a literal substring.
+
+    Backslash is escaped first so the ``%``/``_`` replaces that follow never
+    see an already-escaped backslash (``\`` + ``\%`` would otherwise turn into
+    ``\\%``, which SQLite reads as an escaped backslash followed by any chars).
+    With ``ESCAPE '\'`` the pattern ``\%``/``\_``/``\\`` match the literal
+    ``%``/``_``/``\`` characters.
+    """
+    return text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
 def plan_requires_serial(plan: dict[str, Any]) -> bool:
     """Whether a plan depends on strictly serial (in-order) processing.
 
@@ -604,6 +616,73 @@ class QueueJournal:
                 (cutoff,),
             )
             return cur.rowcount
+
+    # -------------------------------------------------------------- search
+
+    async def search_raw(
+        self, query: str, *, limit: int = 20, include_done: bool = False
+    ) -> list[dict[str, Any]]:
+        """Search raw journal episodes by name / episode_body (LIKE).
+
+        A raw-episode search over the write-ahead journal: an episode is
+        visible here immediately after ``enqueue``, regardless of whether
+        extraction has materialized it in the graph yet - parsing is never a
+        blocker for finding it. Matching is case-insensitive (``COLLATE
+        NOCASE``) over both ``name`` and ``episode_body``; LIKE wildcards in
+        the user query are escaped (``%``, ``_``, ``\``) so user input is never
+        interpreted as a pattern. FTS5 is the scaling option; v1 stays with
+        LIKE.
+
+        Rows come back newest-first (``ORDER BY id DESC``). ``done`` rows are
+        excluded unless ``include_done`` is set. Every entry is marked
+        ``materialized: False`` - the journal is not the graph, materialization
+        is a separate step.
+
+        Args:
+            query: Substring to match against an episode's name or body.
+            limit: Maximum number of rows to return (must be >= 1).
+            include_done: When True, finished episodes are searched too.
+
+        Returns:
+            List of ``{id, status, group_id, name, snippet, created_at,
+            updated_at, materialized}`` dicts, newest first. Empty query /
+            non-positive limit return an empty list.
+        """
+        if not query or not query.strip() or limit < 1:
+            return []
+        pattern = f'%{_escape_like(query)}%'
+        where = (
+            "(name COLLATE NOCASE LIKE ? ESCAPE '\\' "
+            "OR episode_body COLLATE NOCASE LIKE ? ESCAPE '\\')"
+        )
+        params: list[Any] = [pattern, pattern]
+        if not include_done:
+            where += " AND status <> 'done'"
+        params.append(int(limit))
+        sql = (
+            'SELECT id, status, group_id, name, episode_body, created_at, updated_at '
+            f'FROM episode_queue WHERE {where} ORDER BY id DESC LIMIT ?'
+        )
+        async with self._lock:
+            rows = await asyncio.to_thread(self._search_raw_sync, sql, tuple(params))
+        return [
+            {
+                'id': row['id'],
+                'status': row['status'],
+                'group_id': row['group_id'],
+                'name': row['name'],
+                'snippet': (row['episode_body'] or '')[:200],
+                'created_at': row['created_at'],
+                'updated_at': row['updated_at'],
+                'materialized': False,
+            }
+            for row in rows
+        ]
+
+    def _search_raw_sync(self, sql: str, params: tuple) -> list[dict[str, Any]]:
+        """Execute a raw-search SELECT and return plain dicts (runs in a thread)."""
+        cur = self._conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
 
 
 class JournalRetryer:
