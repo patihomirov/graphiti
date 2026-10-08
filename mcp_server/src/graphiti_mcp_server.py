@@ -1231,6 +1231,7 @@ async def health_check(request) -> JSONResponse:
         body['max_queue_depth'] = snapshot.get('max_queue_depth', 20)
         body['pending_episodes'] = snapshot.get('pending_episodes', 0)
         body['retry_after_seconds'] = snapshot.get('retry_after_seconds', 0)
+        body['journal'] = snapshot.get('journal', {'enabled': False})
         if snapshot.get('state') in ('open', 'half_open'):
             body['status'] = 'degraded'
 
@@ -1370,20 +1371,15 @@ async def initialize_server() -> ServerConfig:
     graphiti_client = await graphiti_service.get_client()
     semaphore = graphiti_service.semaphore
 
-    # Initialize queue service with the client
-    await queue_service.initialize(graphiti_client)
+    # Initialize queue service with the client. The episode_builder rebuilds
+    # graphiti.add_episode kwargs from a persisted plan (complex structures are
+    # not persisted and are rebuilt from the live service), and is shared by the
+    # journal-backed workers and the legacy spool retryer.
+    episode_builder = None
 
-    # Start the spool retryer if resilience is enabled.
-    if config.resilience.enabled and config.resilience.spool_enabled and queue_service.spool is not None:
-        resilience = config.resilience
-
-        def episode_builder(plan: dict[str, Any]) -> dict[str, Any]:
-            """Rebuild graphiti.add_episode kwargs from a persisted spool plan.
-
-            Complex structures (entity_types/edge_types/edge_type_map and the
-            EpisodeType enum) are not persisted; they are rebuilt from the live
-            service, mirroring what add_memory passes at queued time.
-            """
+    def _build_episode_builder():
+        def _episode_builder(plan: dict[str, Any]) -> dict[str, Any]:
+            """Rebuild graphiti.add_episode kwargs from a persisted plan."""
             ref = parse_reference_time(plan.get('reference_time'))
             return {
                 'name': plan['name'],
@@ -1403,6 +1399,26 @@ async def initialize_server() -> ServerConfig:
                 'saga_previous_episode_uuid': plan.get('saga_previous_episode_uuid'),
                 'uuid': plan.get('uuid'),
             }
+
+        return _episode_builder
+
+    if config.resilience.enabled:
+        episode_builder = _build_episode_builder()
+
+    await queue_service.initialize(graphiti_client, episode_builder=episode_builder)
+
+    if queue_service.journal is not None:
+        logger.info(
+            'Durable SQLite journal enabled (path=%s, lease=%ss)',
+            queue_service.journal.db_path,
+            config.resilience.journal_lease_seconds,
+        )
+    else:
+        logger.info('Durable SQLite journal disabled')
+
+    # Start the spool retryer if resilience is enabled.
+    if config.resilience.enabled and config.resilience.spool_enabled and queue_service.spool is not None:
+        resilience = config.resilience
 
         episode_retryer = EpisodeRetryer(
             spool=queue_service.spool,
