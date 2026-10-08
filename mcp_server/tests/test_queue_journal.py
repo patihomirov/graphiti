@@ -740,3 +740,48 @@ class TestSearchRaw:
             assert await service.journal_search_raw('anything') == []
         finally:
             await service.close()
+
+
+class TestPhase4ConfigDefaults:
+    """Phase 4 config: bounded breakthrough + per-model reputation defaults.
+
+    All new fields default to behaviour-preserving values (backwards
+    compatible: an empty YAML / a stock ResilienceConfig leaves the write path
+    exactly as it was before Phase 4).
+    """
+
+    @pytest.mark.unit
+    def test_phase4_defaults_preserve_current_behaviour(self):
+        cfg = ResilienceConfig()
+        # Bounded breakthrough intake is off by default: open breaker rejects.
+        assert cfg.enqueue_breakthrough_max_pending == 0
+        # Per-model reputation defaults (300s window, 5 429/min, 60s cooldown).
+        assert cfg.model_reputation_window_seconds == 300.0
+        assert cfg.model_reputation_429_per_min_threshold == 5.0
+        assert cfg.model_reputation_429_cooldown_seconds == 60.0
+
+    @pytest.mark.unit
+    def test_phase4_constraints(self):
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(enqueue_breakthrough_max_pending=-1)
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(model_reputation_window_seconds=0.5)
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(model_reputation_429_per_min_threshold=-1.0)
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(model_reputation_429_cooldown_seconds=-1.0)
+
+    @pytest.mark.unit
+    def test_phase4_values_roundtrip(self):
+        cfg = ResilienceConfig(
+            enqueue_breakthrough_max_pending=7,
+            model_reputation_window_seconds=120.0,
+            model_reputation_429_per_min_threshold=10.0,
+            model_reputation_429_cooldown_seconds=15.0,
+        )
+        assert cfg.enqueue_breakthrough_max_pending == 7
+        assert cfg.model_reputation_window_seconds == 120.0
+        assert cfg.model_reputation_429_per_min_threshold == 10.0
+        assert cfg.model_reputation_429_cooldown_seconds == 15.0

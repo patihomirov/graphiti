@@ -183,3 +183,16 @@ graphiti:
 #   # (see ~/docs/research/graphiti-model-failover*.md).
 #   model_fallbacks:
 #     - "AgentLLM-default"
+#   # Phase 4 - bounded breakthrough intake + per-model routing. While the breaker
+#   # is OPEN, allow up to max_queue_depth + enqueue_breakthrough_max_pending new
+#   # episodes so canaries / critical episodes still reach the durable journal and
+#   # drain on a live fallback (per-model reputation prefers healthy channels).
+#   # 0 keeps the default (open breaker rejects everything). Only meaningful
+#   # together with a non-empty model_fallbacks - with no fallback a breakthrough
+#   # just accumulates rows with nowhere to drain.
+#   enqueue_breakthrough_max_pending: 5
+#   # Per-model reputation window / 429 thresholds used to reorder failover
+#   # candidates: healthy (live) channels are tried before a 429-storming primary.
+#   model_reputation_window_seconds: 300.0
+#   model_reputation_429_per_min_threshold: 5.0
+#   model_reputation_429_cooldown_seconds: 60.0
