@@ -16,6 +16,7 @@ import pytest
 from graphiti_core.llm_client.errors import EmptyResponseError, RateLimitError
 
 from config.schema import ResilienceConfig
+from services.model_reputation import ModelReputationTracker
 from services.queue_journal import QueueJournal
 from services.queue_service import QueueService
 
@@ -364,7 +365,13 @@ class TestHealthAndSerial:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_seriality_preserved_across_failover(self, tmp_path):
-        """Fallback happens inside one claim: FIFO order and no duplicates."""
+        """Fallback happens inside one claim: FIFO order and no duplicates.
+
+        Phase 4 note: the FIRST episode tries the primary (429) then the
+        fallback; once reputation learns the primary is storming, the SECOND
+        episode is routed straight to the live fallback. The per-group FIFO
+        order and exactly-once semantics are unchanged.
+        """
         llm = FakeLLM('model-A')
         client = FailoverGraphiti(llm, fail_on={'model-A'})
         service = QueueService(
@@ -376,10 +383,131 @@ class TestHealthAndSerial:
             await enqueue(service, 'u-s2')
             await wait_done(service, count=2)
             uuids = [kwargs['uuid'] for _, kwargs in client.calls]
-            assert uuids.count('u-s1') == 2  # first attempt + fallback
-            assert uuids.count('u-s2') == 2
+            # u-s1: primary 429 then fallback success; u-s2: fallback only
+            # (reputation prefers the now-known-live channel).
+            assert uuids[0] == 'u-s1'  # primary attempt
+            assert uuids[1] == 'u-s1'  # fallback attempt
+            assert uuids[2] == 'u-s2'  # routed straight to the live fallback
+            assert not any(u == 'u-s2' for u in uuids[:2])
             assert uuids.index('u-s2') > uuids.index('u-s1')
             assert await service.journal.count_done() == 2
             assert await service.journal.claim_next('g1', 'w') is None
+        finally:
+            await service.close()
+
+
+class ReputationClock:
+    """Monotonic clock shared with the simple fake below."""
+
+    def __init__(self, start: float = 1000.0):
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def make_tracker(clock, window=60.0, per_min=5.0, cooldown=60.0):
+    return ModelReputationTracker(
+        window_seconds=window,
+        per_min_threshold=per_min,
+        cooldown_seconds=cooldown,
+        time_fn=clock,
+    )
+
+
+class TestReputationRouting:
+    """Phase 4: _failover_candidates reorders by per-model health."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_healthy_fallback_moves_ahead_of_429_storming_primary(self, tmp_path):
+        clock = ReputationClock()
+        tracker = make_tracker(clock)
+        for _ in range(5):  # model-A 429 rate at/above threshold -> unhealthy
+            tracker.record_429('model-A')
+        llm = FakeLLM('model-A')
+        service = QueueService(
+            make_config(tmp_path / 'rep.db', model_fallbacks=['model-B', 'model-C'])
+        )
+        try:
+            # No attempted models, reputation says primary is storming.
+            assert service._failover_candidates([], llm, tracker) == [
+                'model-B',
+                'model-C',
+                'model-A',
+            ]
+            # Reputation is ignored when not supplied (configured order kept).
+            assert service._failover_candidates([], llm) == [
+                'model-A',
+                'model-B',
+                'model-C',
+            ]
+        finally:
+            await service.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_reputation_keeps_healthy_primary_first(self, tmp_path):
+        tracker = make_tracker(ReputationClock())
+        llm = FakeLLM('model-A')
+        service = QueueService(
+            make_config(tmp_path / 'rep2.db', model_fallbacks=['model-B'])
+        )
+        try:
+            assert service._failover_candidates([], llm, tracker) == ['model-A', 'model-B']
+        finally:
+            await service.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_reputation_preserves_anti_loop_skips_attempted(self, tmp_path):
+        clock = ReputationClock()
+        tracker = make_tracker(clock)
+        for _ in range(5):
+            tracker.record_429('model-A')
+        llm = FakeLLM('model-A')
+        service = QueueService(
+            make_config(tmp_path / 'rep3.db', model_fallbacks=['model-A', 'model-B'])
+        )
+        try:
+            # model-A already attempted this chain: never re-probed, even though
+            # reputation would otherwise drop it behind the fallback.
+            assert service._failover_candidates(['model-A'], llm, tracker) == ['model-B']
+            # Nothing usable remains -> single None candidate (standard path).
+            assert service._failover_candidates(['model-A', 'model-B'], llm, tracker) == [None]
+        finally:
+            await service.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_failover_records_per_model_reputation(self, tmp_path):
+        """A 429 on primary + success on fallback updates reputation + snapshot."""
+        llm = FakeLLM('model-A')
+        client = FailoverGraphiti(llm, fail_on={'model-A'})
+        service = QueueService(
+            make_config(tmp_path / 'rep-e2e.db', model_fallbacks=['model-B'])
+        )
+        await service.initialize(client, episode_builder=make_builder())
+        try:
+            await enqueue(service, 'u-rep')
+            await wait_done(service)
+            stats = service._reputation.per_model_stats()
+            # Primary recorded a 429 (and is thus unhealthy); fallback succeeded.
+            assert stats['model-A']['429'] == 1
+            assert stats['model-A']['healthy'] is False
+            assert stats['model-B']['successes'] == 1
+            assert stats['model-B']['healthy'] is True
+            # The next claim would prefer the healthy fallback first.
+            assert service._failover_candidates([], llm, service._reputation) == [
+                'model-B',
+                'model-A',
+            ]
+            # /health snapshot surfaces the per-model block read-only.
+            snap = await service.get_resilience_snapshot()
+            assert snap['journal']['per_model']['model-A']['429'] == 1
+            assert snap['journal']['per_model']['model-B']['healthy'] is True
         finally:
             await service.close()

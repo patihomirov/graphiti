@@ -347,7 +347,9 @@ class TestQueueServiceJournal:
 
         client.add_episode.side_effect = hold
         service = QueueService(
-            make_config(tmp_path / 'backpressure.db').model_copy(update={'max_queue_depth': 2})
+            make_config(tmp_path / 'backpressure.db').model_copy(
+                update={'journal_max_pending': 2}
+            )
         )
         await service.initialize(client, episode_builder=make_builder())
         try:
@@ -738,5 +740,181 @@ class TestSearchRaw:
         service = QueueService(ResilienceConfig(journal_enabled=False, spool_enabled=False))
         try:
             assert await service.journal_search_raw('anything') == []
+        finally:
+            await service.close()
+
+
+class TestPhase4ConfigDefaults:
+    """Phase 4 config: bounded breakthrough + per-model reputation defaults.
+
+    All new fields default to behaviour-preserving values (backwards
+    compatible: an empty YAML / a stock ResilienceConfig leaves the write path
+    exactly as it was before Phase 4).
+    """
+
+    @pytest.mark.unit
+    def test_phase4_defaults_preserve_current_behaviour(self):
+        cfg = ResilienceConfig()
+        # Bounded breakthrough intake is off by default: open breaker rejects.
+        assert cfg.enqueue_breakthrough_max_pending == 0
+        # Per-model reputation defaults (300s window, 5 429/min, 60s cooldown).
+        assert cfg.model_reputation_window_seconds == 300.0
+        assert cfg.model_reputation_429_per_min_threshold == 5.0
+        assert cfg.model_reputation_429_cooldown_seconds == 60.0
+
+    @pytest.mark.unit
+    def test_phase4_constraints(self):
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(enqueue_breakthrough_max_pending=-1)
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(model_reputation_window_seconds=0.5)
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(model_reputation_429_per_min_threshold=-1.0)
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(model_reputation_429_cooldown_seconds=-1.0)
+
+    @pytest.mark.unit
+    def test_phase4_values_roundtrip(self):
+        cfg = ResilienceConfig(
+            enqueue_breakthrough_max_pending=7,
+            model_reputation_window_seconds=120.0,
+            model_reputation_429_per_min_threshold=10.0,
+            model_reputation_429_cooldown_seconds=15.0,
+        )
+        assert cfg.enqueue_breakthrough_max_pending == 7
+        assert cfg.model_reputation_window_seconds == 120.0
+        assert cfg.model_reputation_429_per_min_threshold == 10.0
+        assert cfg.model_reputation_429_cooldown_seconds == 15.0
+
+
+class TestPhase4BreakthroughIntake:
+    """Phase 4: bounded breakthrough enqueue while the circuit breaker is OPEN."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_open_breaker_breakthrough_allows_bounded_enqueue(self, tmp_path):
+        from graphiti_core.llm_client.errors import RateLimitError
+
+        cfg = make_config(tmp_path / 'brk.db').model_copy(
+            update=dict(journal_max_pending=5, enqueue_breakthrough_max_pending=3)
+        )
+        # NOT initialized: no pool workers, so row counts stay deterministic.
+        service = QueueService(cfg)
+        try:
+            for _ in range(3):
+                await service._breaker.record_failure(RateLimitError())
+            assert service._breaker.state == 'open'
+            # Both zones fill while the breaker stays open (no CircuitOpenError).
+            for i in range(5):
+                await service._add_episode_task_journal('g1', make_plan(uuid=f'brk-{i}'))
+            assert await service.journal.count_pending() == 5
+            # Breakthrough zone: 3 more accepted past journal_max_pending.
+            for i in range(3):
+                await service._add_episode_task_journal('g1', make_plan(uuid=f'boom-{i}'))
+            assert await service.journal.count_pending() == 8
+            # The breakthrough ceiling is journal_max_pending + breakthrough =
+            # 5 + 3 = 8: one more row would exceed it -> capacity reject, not
+            # backpressure from the (now irrelevant) legacy max_queue_depth.
+            with pytest.raises(QueueCapacityExceeded):
+                await service._add_episode_task_journal('g1', make_plan(uuid='overflow'))
+        finally:
+            await service.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_open_breaker_breakthrough_default_rejects(self, tmp_path):
+        """breakthrough=0 (default): an open breaker still rejects - regression."""
+        from graphiti_core.llm_client.errors import RateLimitError
+
+        service = QueueService(make_config(tmp_path / 'brk0.db'))
+        try:
+            for _ in range(3):
+                await service._breaker.record_failure(RateLimitError())
+            assert service._breaker.state == 'open'
+            with pytest.raises(CircuitOpenError):
+                await service._add_episode_task_journal('g1', make_plan(uuid='u-brk0'))
+            assert await service.journal.count_pending() == 0
+        finally:
+            await service.close()
+
+
+class TestJournalMaxPending:
+    """Soft ceiling for durable-journal intake (journal_max_pending).
+
+    Decoupled from the legacy in-memory max_queue_depth (20): the journal path
+    backpressures at pending+processing >= journal_max_pending, while the legacy
+    in-memory path keeps its own max_queue_depth unchanged.
+    """
+
+    @pytest.mark.unit
+    def test_default_is_500(self):
+        cfg = ResilienceConfig()
+        assert cfg.journal_max_pending == 500
+        # The legacy in-memory ceiling is untouched.
+        assert cfg.max_queue_depth == 20
+
+    @pytest.mark.unit
+    def test_override_in_config(self):
+        assert ResilienceConfig(journal_max_pending=3).journal_max_pending == 3
+        assert ResilienceConfig(journal_max_pending=0).journal_max_pending == 0
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            ResilienceConfig(journal_max_pending=-1)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_intake_works_up_to_the_ceiling(self, tmp_path):
+        """With journal_max_pending=3, rows 1..3 are accepted, the 4th rejects."""
+        service = QueueService(
+            make_config(tmp_path / 'cap.db').model_copy(update={'journal_max_pending': 3})
+        )
+        try:
+            for i in range(3):
+                await service._add_episode_task_journal('g1', make_plan(uuid=f'cap-{i}'))
+            assert await service.journal.count_unfinished() == 3
+            with pytest.raises(QueueCapacityExceeded):
+                await service._add_episode_task_journal('g1', make_plan(uuid='cap-overflow'))
+            # The rejected row was not persisted.
+            assert await service.journal.count_unfinished() == 3
+        finally:
+            await service.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_journal_off_preserves_legacy_max_queue_depth_20(self):
+        """Regression: journal disabled -> the in-memory path still uses
+        max_queue_depth (default 20), NOT journal_max_pending."""
+        service = QueueService(ResilienceConfig(spool_enabled=False))
+        assert service._journal is None
+        gate = asyncio.Event()
+
+        async def block():
+            await gate.wait()
+
+        try:
+            for _ in range(20):
+                await service.add_episode_task('g1', block)
+            assert service._queue_depth == 20
+            with pytest.raises(QueueCapacityExceeded):
+                await service.add_episode_task('g1', block)
+            assert service._queue_depth == 20
+        finally:
+            gate.set()
+            await service._episode_queues['g1'].join()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_snapshot_exposes_max_pending(self, tmp_path):
+        """/health journal block surfaces the effective journal ceiling."""
+        service = QueueService(
+            make_config(tmp_path / 'mp.db').model_copy(update={'journal_max_pending': 7})
+        )
+        try:
+            snap = await service.get_resilience_snapshot()
+            assert snap['journal']['enabled'] is True
+            assert snap['journal']['max_pending'] == 7
         finally:
             await service.close()

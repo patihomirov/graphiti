@@ -283,6 +283,16 @@ class ResilienceConfig(BaseModel):
     max_queue_depth: int = Field(
         default=20, description='Max total queued episodes across all group_ids before fail-fast'
     )
+    journal_max_pending: int = Field(
+        default=500,
+        ge=0,
+        description='Soft ceiling for durable-journal intake (pending+processing), '
+        'decoupled from max_queue_depth (the legacy in-memory limit). Journal rows '
+        'live on disk and survive restarts, so a wider ceiling is safe: backpressure '
+        'triggers at pending+processing >= journal_max_pending (plus '
+        'enqueue_breakthrough_max_pending while the circuit is open) instead of the '
+        'RAM-protecting 20 of the in-memory queue.',
+    )
     failure_threshold: int = Field(
         default=3, description='Consecutive transient failures to trip the breaker open'
     )
@@ -363,6 +373,36 @@ class ResilienceConfig(BaseModel):
             'the first not-yet-attempted model wins. Fallbacks use the same '
             'max_tokens as llm.max_tokens. Empty list = failover off.'
         ),
+    )
+    enqueue_breakthrough_max_pending: int = Field(
+        default=0,
+        ge=0,
+        description='How many episodes may be enqueued past max_queue_depth while '
+        'the circuit breaker is OPEN (bounded breakthrough intake). A value of 0 '
+        'keeps the current behaviour: an open breaker rejects every new episode. '
+        'With a value >0 and a configured model_fallbacks, canaries and critical '
+        'episodes still reach the durable journal during a 429 storm and drain on '
+        'a live fallback channel instead of being rejected with '
+        'graphiti_backpressure:.',
+    )
+    model_reputation_window_seconds: float = Field(
+        default=300.0,
+        ge=1.0,
+        description='Sliding-window length (seconds) for per-model reputation '
+        'tracking. 429 / empty / transient / success events older than the window '
+        'are pruned.',
+    )
+    model_reputation_429_per_min_threshold: float = Field(
+        default=5.0,
+        ge=0.0,
+        description='A model is treated as unhealthy when its 429 rate over the '
+        'reputation window exceeds this many events per minute.',
+    )
+    model_reputation_429_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=0.0,
+        description='A 429 seen within this many seconds marks the model unhealthy '
+        'regardless of 429 rate (fresh rate-limit avoidance).',
     )
 
 

@@ -9,6 +9,9 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
+from graphiti_core.llm_client.errors import EmptyResponseError, RateLimitError
+
 from config.schema import ResilienceConfig
 from services.circuit_breaker import (
     CircuitBreaker,
@@ -17,6 +20,7 @@ from services.circuit_breaker import (
     is_transient_error,
 )
 from services.episode_spool import EpisodeSpool
+from services.model_reputation import ModelReputationTracker
 from services.queue_journal import JournalRetryer, QueueJournal
 
 logger = logging.getLogger(__name__)
@@ -42,14 +46,27 @@ class QueueService:
     so they can be replayed by a background retryer.
     """
 
-    def __init__(self, resilience: ResilienceConfig | None = None):
+    def __init__(
+        self,
+        resilience: ResilienceConfig | None = None,
+        journal_max_pending: int | None = None,
+    ):
         """Initialize the queue service.
 
         Args:
             resilience: Optional resilience config. Defaults to a config with
                 all stock defaults so callers that omit the argument keep working.
+            journal_max_pending: Optional soft ceiling for durable-journal intake
+                (pending+processing). Defaults to ``resilience.journal_max_pending``
+                (500) so the journal path is decoupled from the legacy in-memory
+                ``max_queue_depth`` (20).
         """
         self.resilience: ResilienceConfig = resilience or ResilienceConfig()
+        self._journal_max_pending: int = (
+            journal_max_pending
+            if journal_max_pending is not None
+            else self.resilience.journal_max_pending
+        )
         self._breaker: CircuitBreaker | None = None
         self._spool: EpisodeSpool | None = None
 
@@ -118,6 +135,16 @@ class QueueService:
         self._queue_depth: int = 0
         self._depth_lock = asyncio.Lock()
 
+        # Phase 4: in-memory per-model reputation driving failover candidate
+        # ordering (healthy channels first) and the /health per_model block.
+        # Always present (cheap, defaults are behaviour-preserving); it only
+        # starts to matter when model_fallbacks is non-empty.
+        self._reputation = ModelReputationTracker(
+            window_seconds=self.resilience.model_reputation_window_seconds,
+            per_min_threshold=self.resilience.model_reputation_429_per_min_threshold,
+            cooldown_seconds=self.resilience.model_reputation_429_cooldown_seconds,
+        )
+
         if self.resilience.enabled:
             self._breaker = CircuitBreaker(
                 failure_threshold=self.resilience.failure_threshold,
@@ -181,18 +208,33 @@ class QueueService:
         workers claim rows directly from the journal table (claim semantics).
         """
         async with self._depth_lock:
+            breakthrough = self.resilience.enqueue_breakthrough_max_pending
             if self._breaker is not None:
                 allowed = await self._breaker.allow_request()
-                if not allowed:
+                # Phase 4 bounded breakthrough: while the breaker is OPEN,
+                # allow enqueues up to journal_max_pending + breakthrough so
+                # canaries / critical episodes still reach the durable journal
+                # (and drain on a live fallback via per-model routing) instead
+                # of being rejected with graphiti_backpressure:. The capacity
+                # check below bounds the accumulation, so the gateway is never
+                # hammered.
+                if not allowed and (breakthrough <= 0 or self._breaker.state != 'open'):
                     snap = await self._breaker.get_snapshot()
                     raise CircuitOpenError(
                         f'Circuit is open (state={snap["state"]}). '
                         f'Rejecting episode; retry in ~{snap["retry_after_seconds"]}s.'
                     )
             unfinished = await self._journal.count_unfinished()
-            if unfinished >= self.resilience.max_queue_depth:
+            # Journal rows are durable on disk (survive restart), so the intake
+            # ceiling is the wider ``journal_max_pending`` (default 500), NOT the
+            # RAM-protecting ``max_queue_depth`` (20) that still bounds the legacy
+            # in-memory path.
+            capacity = self._journal_max_pending
+            if self._breaker is not None and self._breaker.state == 'open':
+                capacity += breakthrough
+            if unfinished >= capacity:
                 raise QueueCapacityExceeded(
-                    f'Queue depth {unfinished} >= max {self.resilience.max_queue_depth}. '
+                    f'Queue depth {unfinished} >= max {capacity}. '
                     'Rejecting episode; retry once the queue drains.'
                 )
             _, inserted = await self._journal.enqueue(plan)
@@ -400,7 +442,7 @@ class QueueService:
         llm_client = getattr(self._graphiti_client, 'llm_client', None)
         setter = self._model_override_setter(llm_client)
         attempted = self._attempted_from_row(row)
-        candidates = self._failover_candidates(attempted, llm_client)
+        candidates = self._failover_candidates(attempted, llm_client, self._reputation)
 
         last_error: BaseException | None = None
         for model in candidates:
@@ -411,6 +453,7 @@ class QueueService:
                 # path: hold the global semaphore around the actual call.
                 async with self._llm_semaphore:
                     await self._graphiti_client.add_episode(**kwargs)
+                self._record_reputation(model, None)  # success
                 return
             except asyncio.CancelledError:
                 raise
@@ -422,6 +465,7 @@ class QueueService:
                 # standard failure path handles the episode unchanged.
                 if not self._failover_eligible(setter, model, e):
                     raise
+                self._record_reputation(model, e)
                 attempted.append(model)
                 await self._journal.set_attempted_models(row_id, attempted)
                 remaining = len(candidates) - len(attempted)
@@ -452,16 +496,21 @@ class QueueService:
             return []
 
     def _failover_candidates(
-        self, attempted: list[str], llm_client: Any
+        self,
+        attempted: list[str],
+        llm_client: Any,
+        reputation: ModelReputationTracker | None = None,
     ) -> list[str | None]:
         """Ordered list of models to try for a row: active first, then fallbacks.
 
         The active model is ``llm_client.model`` (the configured extraction
         model); ``resilience.model_fallbacks`` are candidates in configured
         order. Models already in ``attempted`` are skipped (never re-tried within
-        the current attempt chain). If there is no active model, or nothing
-        usable remains, a single ``None`` candidate keeps the standard
-        non-overridden path.
+        the current attempt chain). When a reputation tracker is supplied and
+        more than one candidate remains, they are reordered so healthy (live)
+        channels come first - the 429-storming primary drops behind a working
+        fallback. If there is no active model, or nothing usable remains, a
+        single ``None`` candidate keeps the standard non-overridden path.
         """
         active = getattr(llm_client, 'model', None) if llm_client is not None else None
         if not active:
@@ -475,7 +524,42 @@ class QueueService:
         candidates = [m for m in ordered if m not in attempted]
         if not candidates:
             candidates = [None]
+        elif reputation is not None and len(candidates) > 1:
+            candidates = reputation.reorder_by_health(candidates)
         return candidates
+
+    def _record_reputation(self, model: str | None, exc: BaseException | None) -> None:
+        """Record a per-model reputation outcome for a failover attempt.
+
+        ``exc`` None means the attempt succeeded; otherwise the transient error
+        class drives the event kind (429 / empty / transient). Permanent errors
+        are not recorded (they are not provider trouble).
+        """
+        if model is None:
+            return
+        if exc is None:
+            self._reputation.record_success(model)
+            return
+        kind = self._reputation_kind(exc)
+        if kind == '429':
+            self._reputation.record_429(model)
+        elif kind == 'empty':
+            self._reputation.record_empty(model)
+        elif kind == 'transient':
+            self._reputation.record_transient(model)
+
+    @staticmethod
+    def _reputation_kind(exc: BaseException) -> str:
+        """Classify a transient failure into a reputation event kind."""
+        if isinstance(exc, RateLimitError):
+            return '429'
+        if isinstance(exc, EmptyResponseError):
+            return 'empty'
+        if is_transient_error(exc):
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                return '429'
+            return 'transient'
+        return 'permanent'
 
     @staticmethod
     def _model_override_setter(llm_client: Any) -> Callable[[str | None], None] | None:
@@ -898,6 +982,7 @@ class QueueService:
         graphiti_client: Any,
         episode_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         llm_semaphore: asyncio.Semaphore | None = None,
+        journal_max_pending: int | None = None,
     ) -> None:
         """Initialize the queue service with a graphiti client.
 
@@ -910,9 +995,14 @@ class QueueService:
                 omitted, a private semaphore sized from ``resilience.semaphore_limit``
                 is used; pass the server-wide semaphore so the journal pool and the
                 direct path share one LLM concurrency limit.
+            journal_max_pending: Optional soft ceiling for durable-journal intake
+                (pending+processing), overriding whatever the constructor/resilience
+                config resolved. ``None`` keeps the resolved value.
         """
         self._graphiti_client = graphiti_client
         self._episode_builder = episode_builder
+        if journal_max_pending is not None:
+            self._journal_max_pending = journal_max_pending
         if llm_semaphore is not None:
             self._llm_semaphore = llm_semaphore
 
@@ -976,6 +1066,9 @@ class QueueService:
             snapshot['journal'] = {
                 'enabled': True,
                 'path': str(self._journal.db_path),
+                # Soft ceiling for journal intake (pending+processing), decoupled
+                # from the legacy in-memory max_queue_depth (20).
+                'max_pending': self._journal_max_pending,
                 **stats,
                 'processed_1h': metrics['processed'],
                 'avg_processing_seconds': metrics['avg_processing_seconds'],
@@ -985,6 +1078,9 @@ class QueueService:
                 # the journal is on; /health surfaces this so clients can gate
                 # the search_raw_episodes tool.
                 'search': True,
+                # Phase 4: per-model reputation (429 / empty / transient /
+                # success counters + healthy flag) for the /health block.
+                'per_model': self._reputation.per_model_stats(),
             }
         else:
             snapshot['queue_depth'] = self._queue_depth
