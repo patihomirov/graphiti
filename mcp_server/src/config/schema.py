@@ -283,6 +283,16 @@ class ResilienceConfig(BaseModel):
     max_queue_depth: int = Field(
         default=20, description='Max total queued episodes across all group_ids before fail-fast'
     )
+    journal_max_pending: int = Field(
+        default=500,
+        ge=0,
+        description='Soft ceiling for durable-journal intake (pending+processing), '
+        'decoupled from max_queue_depth (the legacy in-memory limit). Journal rows '
+        'live on disk and survive restarts, so a wider ceiling is safe: backpressure '
+        'triggers at pending+processing >= journal_max_pending (plus '
+        'enqueue_breakthrough_max_pending while the circuit is open) instead of the '
+        'RAM-protecting 20 of the in-memory queue.',
+    )
     failure_threshold: int = Field(
         default=3, description='Consecutive transient failures to trip the breaker open'
     )

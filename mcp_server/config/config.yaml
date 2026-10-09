@@ -144,6 +144,12 @@ graphiti:
 # resilience:
 #   enabled: true
 #   max_queue_depth: 20
+#   # Soft ceiling for durable-journal intake (pending+processing), decoupled from
+#   # max_queue_depth (the legacy in-memory limit of 20, which protects RAM). Journal
+#   # rows live durably on disk, so a wider ceiling is safe: backpressure still kicks
+#   # in at pending+processing >= journal_max_pending (+ enqueue_breakthrough_max_pending
+#   # while the circuit is open), just without the narrow in-memory bottleneck.
+#   journal_max_pending: 500
 #   failure_threshold: 3
 #   open_timeout_seconds: 30
 #   spool_enabled: true

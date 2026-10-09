@@ -46,14 +46,27 @@ class QueueService:
     so they can be replayed by a background retryer.
     """
 
-    def __init__(self, resilience: ResilienceConfig | None = None):
+    def __init__(
+        self,
+        resilience: ResilienceConfig | None = None,
+        journal_max_pending: int | None = None,
+    ):
         """Initialize the queue service.
 
         Args:
             resilience: Optional resilience config. Defaults to a config with
                 all stock defaults so callers that omit the argument keep working.
+            journal_max_pending: Optional soft ceiling for durable-journal intake
+                (pending+processing). Defaults to ``resilience.journal_max_pending``
+                (500) so the journal path is decoupled from the legacy in-memory
+                ``max_queue_depth`` (20).
         """
         self.resilience: ResilienceConfig = resilience or ResilienceConfig()
+        self._journal_max_pending: int = (
+            journal_max_pending
+            if journal_max_pending is not None
+            else self.resilience.journal_max_pending
+        )
         self._breaker: CircuitBreaker | None = None
         self._spool: EpisodeSpool | None = None
 
@@ -199,7 +212,7 @@ class QueueService:
             if self._breaker is not None:
                 allowed = await self._breaker.allow_request()
                 # Phase 4 bounded breakthrough: while the breaker is OPEN,
-                # allow enqueues up to max_queue_depth + breakthrough so
+                # allow enqueues up to journal_max_pending + breakthrough so
                 # canaries / critical episodes still reach the durable journal
                 # (and drain on a live fallback via per-model routing) instead
                 # of being rejected with graphiti_backpressure:. The capacity
@@ -212,7 +225,11 @@ class QueueService:
                         f'Rejecting episode; retry in ~{snap["retry_after_seconds"]}s.'
                     )
             unfinished = await self._journal.count_unfinished()
-            capacity = self.resilience.max_queue_depth
+            # Journal rows are durable on disk (survive restart), so the intake
+            # ceiling is the wider ``journal_max_pending`` (default 500), NOT the
+            # RAM-protecting ``max_queue_depth`` (20) that still bounds the legacy
+            # in-memory path.
+            capacity = self._journal_max_pending
             if self._breaker is not None and self._breaker.state == 'open':
                 capacity += breakthrough
             if unfinished >= capacity:
@@ -965,6 +982,7 @@ class QueueService:
         graphiti_client: Any,
         episode_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         llm_semaphore: asyncio.Semaphore | None = None,
+        journal_max_pending: int | None = None,
     ) -> None:
         """Initialize the queue service with a graphiti client.
 
@@ -977,9 +995,14 @@ class QueueService:
                 omitted, a private semaphore sized from ``resilience.semaphore_limit``
                 is used; pass the server-wide semaphore so the journal pool and the
                 direct path share one LLM concurrency limit.
+            journal_max_pending: Optional soft ceiling for durable-journal intake
+                (pending+processing), overriding whatever the constructor/resilience
+                config resolved. ``None`` keeps the resolved value.
         """
         self._graphiti_client = graphiti_client
         self._episode_builder = episode_builder
+        if journal_max_pending is not None:
+            self._journal_max_pending = journal_max_pending
         if llm_semaphore is not None:
             self._llm_semaphore = llm_semaphore
 
@@ -1043,6 +1066,9 @@ class QueueService:
             snapshot['journal'] = {
                 'enabled': True,
                 'path': str(self._journal.db_path),
+                # Soft ceiling for journal intake (pending+processing), decoupled
+                # from the legacy in-memory max_queue_depth (20).
+                'max_pending': self._journal_max_pending,
                 **stats,
                 'processed_1h': metrics['processed'],
                 'avg_processing_seconds': metrics['avg_processing_seconds'],
