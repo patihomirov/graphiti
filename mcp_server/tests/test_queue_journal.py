@@ -918,3 +918,124 @@ class TestJournalMaxPending:
             assert snap['journal']['max_pending'] == 7
         finally:
             await service.close()
+
+
+class TestMarkVerified:
+    """In-queue fact-check marker: a validator stamps verified_by/verified_at
+    directly on a raw journal row, without waiting for graph materialization."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_verified_sets_by_and_at(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mv-1', name='verify me', episode_body='raw body')
+        )
+        assert (
+            await journal.mark_verified(
+                row_id, by='validator-hard', at='2026-10-09T10:00:00+00:00'
+            )
+            is True
+        )
+        hits = await journal.search_raw('verify me')
+        assert len(hits) == 1
+        entry = hits[0]
+        assert entry['verified_by'] == 'validator-hard'
+        assert entry['verified_at'] == '2026-10-09T10:00:00+00:00'
+        # The fact-check marker does not touch the row status.
+        assert entry['status'] == 'pending'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_verified_defaults_at_to_now(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mv-now', name='now stamp', episode_body='b')
+        )
+        assert await journal.mark_verified(row_id, by='validator') is True
+        hits = await journal.search_raw('now stamp')
+        assert hits[0]['verified_by'] == 'validator'
+        assert hits[0]['verified_at'] is not None
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_verified_second_call_updates_to_latest(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mv-2', name='recheck', episode_body='b')
+        )
+        first = '2026-10-09T10:00:00+00:00'
+        second = '2026-10-09T11:30:00+00:00'
+        assert await journal.mark_verified(row_id, by='validator', at=first) is True
+        assert await journal.mark_verified(row_id, by='validator-hard', at=second) is True
+        hits = await journal.search_raw('recheck')
+        assert hits[0]['verified_by'] == 'validator-hard'
+        assert hits[0]['verified_at'] == second
+        # Still pending after every fact-check stamp.
+        assert hits[0]['status'] == 'pending'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_verified_unknown_row_returns_false(self, journal):
+        assert await journal.mark_verified(999_999, by='validator') is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_verified_does_not_change_status(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mv-st', name='status stable', episode_body='b')
+        )
+        await journal.mark_verified(row_id, by='validator', at='2026-10-09T10:00:00+00:00')
+        # Still pending, still claimable by a worker.
+        assert await journal.count_pending() == 1
+        claimed = await journal.claim_next('g1', 'w')
+        assert claimed is not None and claimed['id'] == row_id
+        # The verified marker survives the claim (fact-check provenance kept).
+        assert claimed['verified_by'] == 'validator'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_migration_adds_verified_columns(self, tmp_path):
+        # A pre-verified journal has no verified_by/verified_at columns; opening
+        # it with the current QueueJournal must add them idempotently, and
+        # search/claim must work on the migrated schema.
+        db = tmp_path / 'legacy-verified.db'
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            'CREATE TABLE episode_queue ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, dedup_key TEXT NOT NULL, uuid TEXT, '
+            'group_id TEXT NOT NULL, name TEXT NOT NULL, episode_body TEXT NOT NULL, '
+            "plan_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK (status IN ('pending', 'processing', 'done', 'failed')), "
+            'attempt INTEGER NOT NULL DEFAULT 0, worker_id TEXT, lease_until TEXT, '
+            'first_failure_ts TEXT, last_attempt_ts TEXT, next_retry_at TEXT, '
+            'error TEXT, requires_serial INTEGER NOT NULL DEFAULT 0, '
+            'created_at TEXT NOT NULL, updated_at TEXT NOT NULL)'
+        )
+        conn.commit()
+        conn.close()
+
+        j = QueueJournal(db, lease_seconds=300.0)
+        try:
+            cols = {
+                r[1]
+                for r in sqlite3.connect(db).execute('PRAGMA table_info(episode_queue)')
+            }
+            assert 'verified_by' in cols
+            assert 'verified_at' in cols
+            # Fresh writes + fact-check + search work on the migrated schema.
+            row_id, inserted = await j.enqueue(
+                make_plan(uuid='mv-mig', name='migrated row', episode_body='body')
+            )
+            assert inserted is True and row_id > 0
+            assert (
+                await j.mark_verified(
+                    row_id, by='validator', at='2026-10-09T10:00:00+00:00'
+                )
+                is True
+            )
+            hits = await j.search_raw('migrated row')
+            assert hits[0]['verified_by'] == 'validator'
+            # Claim uses the full _ROW_COLUMNS on the migrated table.
+            claimed = await j.claim_next('g1', 'w')
+            assert claimed is not None and claimed['id'] == row_id
+            assert claimed['verified_by'] == 'validator'
+        finally:
+            await j.close()

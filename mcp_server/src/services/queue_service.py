@@ -969,7 +969,9 @@ class QueueService:
 
         Backs the ``search_raw_episodes`` MCP tool. Returns ``[]`` when the
         journal is disabled - there is nothing to search - instead of raising,
-        so the read path never breaks a journal-off server.
+        so the read path never breaks a journal-off server. Passes the journal
+        rows through unchanged, so entries also carry the in-queue
+        ``verified_by``/``verified_at`` fact-check markers from ``search_raw``.
         """
         if self._journal is None:
             return []

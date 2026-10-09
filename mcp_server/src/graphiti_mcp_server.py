@@ -943,7 +943,8 @@ async def search_raw_episodes(
 
     Returns:
         A list of ``{id, status, group_id, name, snippet, created_at, updated_at,
-        materialized}`` dicts, or a structured error dict when the journal is off.
+        verified_by, verified_at, materialized}`` dicts, or a structured error
+        dict when the journal is off.
     """
     global queue_service
 

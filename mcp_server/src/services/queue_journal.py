@@ -62,6 +62,8 @@ _ROW_COLUMNS = (
     'error',
     'requires_serial',
     'attempted_models',
+    'verified_by',
+    'verified_at',
     'created_at',
     'updated_at',
 )
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS episode_queue (
     last_attempt_ts  TEXT,
     next_retry_at  TEXT,
     error          TEXT,
+    verified_by    TEXT,
+    verified_at    TEXT,
     requires_serial INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
@@ -205,6 +209,17 @@ class QueueJournal:
             # existed simply have none attempted.
             self._conn.execute(
                 'ALTER TABLE episode_queue ADD COLUMN attempted_models TEXT'
+            )
+        if 'verified_by' not in existing:
+            # In-queue fact-check marker (who verified this raw episode). Rows
+            # created before the column existed simply have no verification.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN verified_by TEXT'
+            )
+        if 'verified_at' not in existing:
+            # Fact-check timestamp (ISO UTC) paired with ``verified_by``.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN verified_at TEXT'
             )
         # Created here (after any ALTER) so it is valid on both fresh and
         # migrated journals; an early CREATE with the missing column would fail.
@@ -445,6 +460,35 @@ class QueueJournal:
             (json.dumps(models, ensure_ascii=False), _now_iso(), row_id),
         )
 
+    async def mark_verified(self, row_id: int, *, by: str, at: str | None = None) -> bool:
+        """Stamp a durable journal row as fact-checked in place (in-queue verification).
+
+        Records who verified the raw episode and when directly on the journal
+        row, so a validator can mark a pending episode as "checked" immediately
+        after a fact-check against ``search_raw`` - without waiting for the
+        episode to be materialized in the graph (graph-level ``verified_by`` is
+        stamped separately later by the materialized fact).
+
+        Idempotent: re-calling updates the marker to the latest fact-check.
+
+        Args:
+            row_id: The journal row to mark.
+            by: Verifier identity (e.g. 'validator-hard').
+            at: Fact-check timestamp in ISO UTC; defaults to now.
+
+        Returns:
+            True when the row was updated, False when ``row_id`` does not exist.
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync,
+                self._conn,
+                'UPDATE episode_queue SET verified_by=?, verified_at=?, updated_at=? '
+                'WHERE id=?',
+                (by, at or _now_iso(), _now_iso(), row_id),
+            )
+            return cur.rowcount > 0
+
     async def mark_failed(self, row_id: int, error: str) -> None:
         """Move an exhausted row to failed/ for manual re-add (analogous to the spool)."""
         await self._execute(
@@ -682,8 +726,8 @@ class QueueJournal:
 
         Returns:
             List of ``{id, status, group_id, name, snippet, created_at,
-            updated_at, materialized}`` dicts, newest first. Empty query /
-            non-positive limit return an empty list.
+            updated_at, verified_by, verified_at, materialized}`` dicts, newest
+            first. Empty query / non-positive limit return an empty list.
         """
         if not query or not query.strip() or limit < 1:
             return []
@@ -697,7 +741,8 @@ class QueueJournal:
             where += " AND status <> 'done'"
         params.append(int(limit))
         sql = (
-            'SELECT id, status, group_id, name, episode_body, created_at, updated_at '
+            'SELECT id, status, group_id, name, episode_body, created_at, updated_at, '
+            'verified_by, verified_at '
             f'FROM episode_queue WHERE {where} ORDER BY id DESC LIMIT ?'
         )
         async with self._lock:
@@ -711,6 +756,8 @@ class QueueJournal:
                 'snippet': (row['episode_body'] or '')[:200],
                 'created_at': row['created_at'],
                 'updated_at': row['updated_at'],
+                'verified_by': row['verified_by'],
+                'verified_at': row['verified_at'],
                 'materialized': False,
             }
             for row in rows
