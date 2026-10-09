@@ -1,10 +1,16 @@
 """Queue service for managing episode processing."""
 
 import asyncio
+import contextlib
+import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import httpx
+from graphiti_core.llm_client.errors import EmptyResponseError, RateLimitError
 
 from config.schema import ResilienceConfig
 from services.circuit_breaker import (
@@ -14,6 +20,8 @@ from services.circuit_breaker import (
     is_transient_error,
 )
 from services.episode_spool import EpisodeSpool
+from services.model_reputation import ModelReputationTracker
+from services.queue_journal import JournalRetryer, QueueJournal
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +46,72 @@ class QueueService:
     so they can be replayed by a background retryer.
     """
 
-    def __init__(self, resilience: ResilienceConfig | None = None):
+    def __init__(
+        self,
+        resilience: ResilienceConfig | None = None,
+        journal_max_pending: int | None = None,
+    ):
         """Initialize the queue service.
 
         Args:
             resilience: Optional resilience config. Defaults to a config with
                 all stock defaults so callers that omit the argument keep working.
+            journal_max_pending: Optional soft ceiling for durable-journal intake
+                (pending+processing). Defaults to ``resilience.journal_max_pending``
+                (500) so the journal path is decoupled from the legacy in-memory
+                ``max_queue_depth`` (20).
         """
         self.resilience: ResilienceConfig = resilience or ResilienceConfig()
+        self._journal_max_pending: int = (
+            journal_max_pending
+            if journal_max_pending is not None
+            else self.resilience.journal_max_pending
+        )
         self._breaker: CircuitBreaker | None = None
         self._spool: EpisodeSpool | None = None
+
+        # Durable SQLite journal (source of truth for the write path when
+        # resilience.journal_enabled is true). Constructed eagerly: a failure to
+        # open it is fatal (fail-closed, D5) rather than a silent fallback to
+        # the lossy in-memory queue.
+        self._journal: QueueJournal | None = None
+        if self.resilience.journal_enabled:
+            journal_path = self.resilience.journal_path or '~/.graphiti/journal.db'
+            self._journal = QueueJournal(
+                journal_path,
+                lease_seconds=self.resilience.journal_lease_seconds,
+            )
+        # Alarm that wakes group workers when journal rows become due for retry.
+        self._journal_retryer: JournalRetryer | None = None
+        # Sync view of journal-backed per-group unfinished counts (legacy API).
+        self._journal_queue_sizes: dict[str, int] = {}
+        # Rebuilds graphiti.add_episode kwargs from a persisted journal plan.
+        self._episode_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        # Claim owner tag for journal rows (f'p<pid>'), a phase-2 lease hook.
+        self._worker_id = f'p{os.getpid()}'
+        # How long a journal worker sleeps between no-work wake checks.
+        self._journal_idle_timeout = 30.0
+
+        # Global journal worker pool (phase 2). ``journal_workers`` tasks serve
+        # ALL groups: a worker picks a group with due rows, claims exactly one
+        # row under that group's processing lock, then repeats. The per-group
+        # lock keeps within-group processing strictly FIFO and never
+        # parallelizes serial zones.
+        self._pool_tasks: list[asyncio.Task] = []
+        self._pool_started = False
+        self._group_locks: dict[str, asyncio.Lock] = {}
+        # Pool wake primitive: a sticky event + generation counter (a bare
+        # event.clear() lost wakeups under N workers).
+        self._wake_event = asyncio.Event()
+        self._wake_generation = 0
+        self._poll_interval = 0.05
+        # Global cap on concurrent add_episode calls. initialize() may replace it
+        # with the server-wide semaphore so the pool and the direct path share
+        # one LLM concurrency limit.
+        self._llm_semaphore = asyncio.Semaphore(int(self.resilience.semaphore_limit))
+        # Periodic lease steward (phase 2): requeues rows whose owner vanished,
+        # while never stealing this process's own in-flight rows.
+        self._steward_task: asyncio.Task | None = None
 
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
@@ -56,8 +120,10 @@ class QueueService:
         # Worker task handles per group_id, used to cancel in-flight episodes
         # during a graceful drain.
         self._worker_tasks: dict[str, asyncio.Task] = {}
-        # True while a worker is awaiting its process_func (episode in flight).
-        self._busy: dict[str, bool] = {}
+        # In-flight episode count per group. A counter (not a bool) so
+        # ``_any_busy`` sees every concurrent in-flight episode, even if a
+        # group were ever processed by more than one worker.
+        self._busy_counts: dict[str, int] = {}
         # Flipped by the graceful shutdown coordinator on SIGTERM/SIGINT.
         self._stopping: bool = False
         # Store the graphiti client after initialization
@@ -69,10 +135,21 @@ class QueueService:
         self._queue_depth: int = 0
         self._depth_lock = asyncio.Lock()
 
+        # Phase 4: in-memory per-model reputation driving failover candidate
+        # ordering (healthy channels first) and the /health per_model block.
+        # Always present (cheap, defaults are behaviour-preserving); it only
+        # starts to matter when model_fallbacks is non-empty.
+        self._reputation = ModelReputationTracker(
+            window_seconds=self.resilience.model_reputation_window_seconds,
+            per_min_threshold=self.resilience.model_reputation_429_per_min_threshold,
+            cooldown_seconds=self.resilience.model_reputation_429_cooldown_seconds,
+        )
+
         if self.resilience.enabled:
             self._breaker = CircuitBreaker(
                 failure_threshold=self.resilience.failure_threshold,
                 open_timeout_seconds=self.resilience.open_timeout_seconds,
+                probe_timeout_seconds=self.resilience.probe_timeout_seconds,
             )
             if self.resilience.spool_enabled:
                 self._spool = EpisodeSpool(
@@ -111,6 +188,76 @@ class QueueService:
                 'Server is stopping (graceful drain in progress). '
                 'Episode NOT queued; retry after the server restarts.'
             )
+
+        # Journal-backed path: the plan is persisted atomically to SQLite (the
+        # source of truth) BEFORE any in-memory state changes, so it survives a
+        # hard kill. Backpressure is computed from journal rows so it stays
+        # correct after a restart.
+        if self._journal is not None and plan is not None:
+            return await self._add_episode_task_journal(group_id, plan)
+
+        # Legacy path (journal disabled, or a bare process_func with plan=None):
+        # the in-memory queue remains the notification mechanism.
+        return await self._add_episode_task_legacy(group_id, process_func, plan)
+
+    async def _add_episode_task_journal(self, group_id: str, plan: dict[str, Any]) -> int:
+        """Journal-backed add_episode_task: persist the plan, then wake a worker.
+
+        Fail-fast backpressure (stopping, breaker, capacity) is applied *before*
+        the atomic INSERT. The in-memory queue is NOT used for real episodes;
+        workers claim rows directly from the journal table (claim semantics).
+        """
+        async with self._depth_lock:
+            breakthrough = self.resilience.enqueue_breakthrough_max_pending
+            if self._breaker is not None:
+                allowed = await self._breaker.allow_request()
+                # Phase 4 bounded breakthrough: while the breaker is OPEN,
+                # allow enqueues up to journal_max_pending + breakthrough so
+                # canaries / critical episodes still reach the durable journal
+                # (and drain on a live fallback via per-model routing) instead
+                # of being rejected with graphiti_backpressure:. The capacity
+                # check below bounds the accumulation, so the gateway is never
+                # hammered.
+                if not allowed and (breakthrough <= 0 or self._breaker.state != 'open'):
+                    snap = await self._breaker.get_snapshot()
+                    raise CircuitOpenError(
+                        f'Circuit is open (state={snap["state"]}). '
+                        f'Rejecting episode; retry in ~{snap["retry_after_seconds"]}s.'
+                    )
+            unfinished = await self._journal.count_unfinished()
+            # Journal rows are durable on disk (survive restart), so the intake
+            # ceiling is the wider ``journal_max_pending`` (default 500), NOT the
+            # RAM-protecting ``max_queue_depth`` (20) that still bounds the legacy
+            # in-memory path.
+            capacity = self._journal_max_pending
+            if self._breaker is not None and self._breaker.state == 'open':
+                capacity += breakthrough
+            if unfinished >= capacity:
+                raise QueueCapacityExceeded(
+                    f'Queue depth {unfinished} >= max {capacity}. '
+                    'Rejecting episode; retry once the queue drains.'
+                )
+            _, inserted = await self._journal.enqueue(plan)
+
+        if not inserted:
+            logger.info(
+                'Duplicate episode %s (name=%s) skipped by journal dedup',
+                plan.get('uuid'),
+                plan.get('name'),
+            )
+
+        await self._wake_group(group_id)
+        size = await self._journal.count_unfinished_group(group_id)
+        self._journal_queue_sizes[group_id] = size
+        return size
+
+    async def _add_episode_task_legacy(
+        self,
+        group_id: str,
+        process_func: Callable[[], Awaitable[None]],
+        plan: dict[str, Any] | None = None,
+    ) -> int:
+        """Legacy in-memory add_episode_task (journal disabled / plan=None)."""
         if self.resilience.enabled:
             async with self._depth_lock:
                 if self._breaker is not None:
@@ -160,54 +307,18 @@ class QueueService:
         return self._episode_queues[group_id].qsize()
 
     async def _process_episode_queue(self, group_id: str) -> None:
-        """Process episodes for a specific group_id sequentially.
+        """Process episodes for a group sequentially (legacy in-memory mode).
 
-        This function runs as a long-lived task that processes episodes
-        from the queue one at a time. Failed episodes are spooled to disk so they
-        can be recovered by the background retryer.
+        Journal-backed mode is served by the global worker pool
+        (``_journal_pool_worker``); this loop only ever drains the legacy
+        in-memory queues.
         """
         logger.info(f'Starting episode queue worker for group_id: {group_id}')
         self._queue_workers[group_id] = True
 
         try:
             while True:
-                # Get the next episode processing tuple from the queue
-                # This will wait if the queue is empty
-                process_func, plan = await self._episode_queues[group_id].get()
-
-                try:
-                    # Mark the worker busy so the graceful drain knows this
-                    # episode is in flight (not merely pending in the queue).
-                    self._busy[group_id] = True
-                    # Process the episode
-                    await process_func()
-                except asyncio.CancelledError:
-                    # The graceful drain cancels workers whose in-flight episode
-                    # did not finish within the grace window. Spool it so the
-                    # retryer replays it after restart instead of losing it.
-                    if self._stopping and self._spool is not None and plan is not None:
-                        try:
-                            self._spool.save(plan, reason='cancelled during graceful drain')
-                            logger.warning(
-                                'Graceful drain: spooled in-flight episode %s (name=%s) of group %s',
-                                plan.get('uuid'),
-                                plan.get('name'),
-                                group_id,
-                            )
-                        except Exception as se:
-                            logger.error(f'Failed to spool cancelled episode {plan.get("uuid")}: {se}')
-                    raise
-                except Exception as e:
-                    await self._handle_processing_failure(group_id, plan, e)
-                else:
-                    if self._breaker is not None:
-                        await self._breaker.record_success()
-                finally:
-                    self._busy[group_id] = False
-                    # Decrement the shared depth invariant and mark done regardless
-                    # of success/failure.
-                    self._queue_depth = max(0, self._queue_depth - 1)
-                    self._episode_queues[group_id].task_done()
+                await self._process_legacy_once(group_id)
         except asyncio.CancelledError:
             logger.info(f'Episode queue worker for group_id {group_id} was cancelled')
         except Exception as e:
@@ -215,6 +326,461 @@ class QueueService:
         finally:
             self._queue_workers[group_id] = False
             logger.info(f'Stopped episode queue worker for group_id: {group_id}')
+
+    async def _process_legacy_once(self, group_id: str) -> bool:
+        """Handle a single episode from the in-memory queue (legacy mode)."""
+        # Get the next episode processing tuple from the queue (waits if empty).
+        process_func, plan = await self._episode_queues[group_id].get()
+
+        try:
+            # Mark the worker busy so the graceful drain knows this
+            # episode is in flight (not merely pending in the queue).
+            self._busy_counts[group_id] = self._busy_counts.get(group_id, 0) + 1
+            # Process the episode
+            await process_func()
+        except asyncio.CancelledError:
+            # The graceful drain cancels workers whose in-flight episode
+            # did not finish within the grace window. Spool it so the
+            # retryer replays it after restart instead of losing it.
+            if self._stopping and self._spool is not None and plan is not None:
+                try:
+                    self._spool.save(plan, reason='cancelled during graceful drain')
+                    logger.warning(
+                        'Graceful drain: spooled in-flight episode %s (name=%s) of group %s',
+                        plan.get('uuid'),
+                        plan.get('name'),
+                        group_id,
+                    )
+                except Exception as se:
+                    logger.error(f'Failed to spool cancelled episode {plan.get("uuid")}: {se}')
+            raise
+        except Exception as e:
+            await self._handle_processing_failure(group_id, plan, e)
+        else:
+            if self._breaker is not None:
+                await self._breaker.record_success()
+        finally:
+            count = self._busy_counts.get(group_id, 0) - 1
+            if count > 0:
+                self._busy_counts[group_id] = count
+            else:
+                self._busy_counts.pop(group_id, None)
+            # Decrement the shared depth invariant and mark done regardless
+            # of success/failure.
+            self._queue_depth = max(0, self._queue_depth - 1)
+            self._episode_queues[group_id].task_done()
+        return True
+
+    async def _process_journal_once(self, group_id: str) -> bool:
+        """Claim and process a single journal row for a group. Returns False if none."""
+        row = await self._journal.claim_next(group_id, self._worker_id)
+        if row is None:
+            return False
+
+        self._busy_counts[group_id] = self._busy_counts.get(group_id, 0) + 1
+        # Keep the lease fresh for long in-flight LLM calls so the steward never
+        # steals our own row; cancelled in ``finally`` once the row is done.
+        heartbeat = asyncio.create_task(self._journal_heartbeat_loop(row['id']))
+        try:
+            plan = json.loads(row['plan_json'])
+            if self._episode_builder is None:  # guarded by caller, defensive
+                raise RuntimeError('No episode_builder configured for journal processing')
+            kwargs = self._episode_builder(plan)
+            # Multi-model failover (phase 3, variant 'b'): the whole episode is
+            # processed by a single chosen model; on a transient failure (429 /
+            # empty response / transport) the worker retries the same row inline,
+            # inside this claim, with the next not-yet-attempted fallback model.
+            # The shared LLM semaphore is held around each add_episode call.
+            await self._process_with_failover(row, kwargs)
+        except asyncio.CancelledError:
+            # The row stays 'processing'; requeue_stale() on the next boot
+            # (or a stale-lease cleanup) heals it after the hard kill.
+            raise
+        except Exception as e:
+            await self._handle_journal_failure(group_id, row, e)
+        else:
+            await self._journal.mark_done(row['id'])
+            if self._breaker is not None:
+                await self._breaker.record_success()
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+            count = self._busy_counts.get(group_id, 0) - 1
+            if count > 0:
+                self._busy_counts[group_id] = count
+            else:
+                self._busy_counts.pop(group_id, None)
+            size = await self._journal.count_unfinished_group(group_id)
+            self._journal_queue_sizes[group_id] = size
+        return True
+
+    async def _process_with_failover(
+        self, row: dict[str, Any], kwargs: dict[str, Any]
+    ) -> None:
+        """Run one claimed journal row, failing over across models on transient errors.
+
+        Implements the worker-level (variant 'b') multi-model design: the ENTIRE
+        episode is processed by a single chosen model so graph extraction stays
+        consistent (never a mix of models inside one episode). When the currently
+        selected model fails transiently (RateLimitError / EmptyResponseError /
+        transport error), the worker retries the SAME row inline — within the
+        same claim, without releasing it and without any circuit-breaker
+        interaction — using the next model from ``resilience.model_fallbacks``
+        that this row has not tried yet (``attempted_models`` journal column).
+
+        The breaker only ever sees the final outcome of the whole chain
+        (record_success / record_failure in the caller), so a failover hop never
+        burns a half-open probe and never trips the breaker on a mid-chain
+        failure (cf. the 680a069 fix). Inline fallback attempts do NOT increment
+        ``attempt``: one logical attempt = one run of the episode, so a 429 storm
+        cannot exhaust ``max_spool_attempts``. When every candidate is exhausted
+        the last exception is re-raised so the standard path (bump_retry +
+        exponential backoff) takes over.
+        """
+        row_id = int(row['id'])
+        llm_client = getattr(self._graphiti_client, 'llm_client', None)
+        setter = self._model_override_setter(llm_client)
+        attempted = self._attempted_from_row(row)
+        candidates = self._failover_candidates(attempted, llm_client, self._reputation)
+
+        last_error: BaseException | None = None
+        for model in candidates:
+            if setter is not None:
+                setter(model)
+            try:
+                # LLM + graph write is the scarce resource shared with the direct
+                # path: hold the global semaphore around the actual call.
+                async with self._llm_semaphore:
+                    await self._graphiti_client.add_episode(**kwargs)
+                self._record_reputation(model, None)  # success
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = e
+                # Failover only applies to transient provider trouble AND only
+                # when model switching is actually available (a real llm_client
+                # exposing set_model_override, an known model id). Otherwise the
+                # standard failure path handles the episode unchanged.
+                if not self._failover_eligible(setter, model, e):
+                    raise
+                self._record_reputation(model, e)
+                attempted.append(model)
+                await self._journal.set_attempted_models(row_id, attempted)
+                remaining = len(candidates) - len(attempted)
+                logger.warning(
+                    'Episode %s (name=%s) failed on model %r (%s); %d fallback(s) left',
+                    row.get('uuid'),
+                    row.get('name'),
+                    model,
+                    e,
+                    remaining,
+                )
+            finally:
+                if setter is not None:
+                    setter(None)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError('failover produced no outcome')  # pragma: no cover
+
+    @staticmethod
+    def _attempted_from_row(row: dict[str, Any]) -> list[str]:
+        """Parse the ``attempted_models`` JSON column of a claimed row (anti-loop)."""
+        raw = row.get('attempted_models') or '[]'
+        try:
+            parsed = json.loads(raw)
+            return [str(m) for m in parsed] if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def _failover_candidates(
+        self,
+        attempted: list[str],
+        llm_client: Any,
+        reputation: ModelReputationTracker | None = None,
+    ) -> list[str | None]:
+        """Ordered list of models to try for a row: active first, then fallbacks.
+
+        The active model is ``llm_client.model`` (the configured extraction
+        model); ``resilience.model_fallbacks`` are candidates in configured
+        order. Models already in ``attempted`` are skipped (never re-tried within
+        the current attempt chain). When a reputation tracker is supplied and
+        more than one candidate remains, they are reordered so healthy (live)
+        channels come first - the 429-storming primary drops behind a working
+        fallback. If there is no active model, or nothing usable remains, a
+        single ``None`` candidate keeps the standard non-overridden path.
+        """
+        active = getattr(llm_client, 'model', None) if llm_client is not None else None
+        if not active:
+            # No active model -> multi-model failover is meaningless; the
+            # standard non-overridden path handles the episode.
+            return [None]
+        ordered: list[str] = [active]
+        for fallback in self.resilience.model_fallbacks or []:
+            if fallback and fallback not in ordered:
+                ordered.append(fallback)
+        candidates = [m for m in ordered if m not in attempted]
+        if not candidates:
+            candidates = [None]
+        elif reputation is not None and len(candidates) > 1:
+            candidates = reputation.reorder_by_health(candidates)
+        return candidates
+
+    def _record_reputation(self, model: str | None, exc: BaseException | None) -> None:
+        """Record a per-model reputation outcome for a failover attempt.
+
+        ``exc`` None means the attempt succeeded; otherwise the transient error
+        class drives the event kind (429 / empty / transient). Permanent errors
+        are not recorded (they are not provider trouble).
+        """
+        if model is None:
+            return
+        if exc is None:
+            self._reputation.record_success(model)
+            return
+        kind = self._reputation_kind(exc)
+        if kind == '429':
+            self._reputation.record_429(model)
+        elif kind == 'empty':
+            self._reputation.record_empty(model)
+        elif kind == 'transient':
+            self._reputation.record_transient(model)
+
+    @staticmethod
+    def _reputation_kind(exc: BaseException) -> str:
+        """Classify a transient failure into a reputation event kind."""
+        if isinstance(exc, RateLimitError):
+            return '429'
+        if isinstance(exc, EmptyResponseError):
+            return 'empty'
+        if is_transient_error(exc):
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                return '429'
+            return 'transient'
+        return 'permanent'
+
+    @staticmethod
+    def _model_override_setter(llm_client: Any) -> Callable[[str | None], None] | None:
+        """Return the client's model-override hook, or None when unavailable."""
+        setter = getattr(llm_client, 'set_model_override', None)
+        return setter if callable(setter) else None
+
+    @staticmethod
+    def _failover_eligible(
+        setter: Callable[[str | None], None] | None,
+        model: str | None,
+        exc: BaseException,
+    ) -> bool:
+        """Whether a transient failure on ``model`` may fall over to the next one."""
+        if setter is None or model is None:
+            return False
+        return is_transient_error(exc)
+
+    async def _journal_pool_worker(self) -> None:
+        """Serve journal groups from the global worker pool.
+
+        A worker picks a group with due rows whose processing lock is free,
+        claims and processes exactly one row under that lock, then repeats. The
+        per-group lock guarantees at most one in-flight episode per group, so
+        within-group order stays strictly FIFO (claim by id) and serial zones
+        (auto-previous context / saga chains / update_communities) are never
+        parallelized - the pool size only adds cross-group concurrency.
+        """
+        try:
+            while True:
+                if self._stopping:
+                    return
+                if self._episode_builder is None:
+                    await self._journal_wait_global()
+                    continue
+                group_id = await self._pick_group()
+                if group_id is None:
+                    await self._journal_wait_global()
+                    continue
+                lock = self._group_locks.setdefault(group_id, asyncio.Lock())
+                if not await lock.acquire():
+                    # Another worker holds this group's lock; re-scan the pool.
+                    await self._journal_wait_global()
+                    continue
+                try:
+                    await self._process_journal_once(group_id)
+                finally:
+                    lock.release()
+        except asyncio.CancelledError:
+            logger.info('Journal pool worker cancelled')
+            raise
+        except Exception as e:
+            logger.error('Unexpected error in journal pool worker: %s', e)
+
+    async def _pick_group(self) -> str | None:
+        """Return the first group with due rows whose lock is currently free."""
+        digest = await self._journal.due_digest()
+        for group_id in digest:
+            lock = self._group_locks.get(group_id)
+            if lock is None or not lock.locked():
+                return group_id
+        return None
+
+    async def _has_due_work(self) -> bool:
+        """Whether any group currently has due rows this worker could claim.
+
+        Considers *pending-and-due* rows only, so a worker whose group is
+        mid-flight (row ``processing``) idles instead of hot-polling.
+        """
+        return await self._pick_group() is not None
+
+    async def _journal_wait_global(self) -> None:
+        """Idle a pool worker until the pool is woken or the idle timeout hits.
+
+        The wake event is cleared only after verifying there is no claimable
+        work, with the queue re-checked right after the clear and again after
+        any wake, so a wake that lands mid-wait is never lost (a generation
+        counter pins it). This replaces the old per-group ``_journal_wait``,
+        whose ``event.clear()`` race was unsafe with N workers.
+        """
+        while True:
+            if self._stopping:
+                return
+            if await self._has_due_work():
+                return
+            event = self._wake_event
+            gen = self._wake_generation
+            event.clear()
+            if await self._has_due_work():
+                return
+            try:
+                await asyncio.wait_for(event.wait(), timeout=self._journal_idle_timeout)
+            except asyncio.TimeoutError:
+                return
+            if gen != self._wake_generation:
+                return
+            if await self._has_due_work():
+                return
+            # The event was set by a wake already consumed by another worker and
+            # the generation has not advanced: nothing new is due. Step back
+            # briefly rather than spinning, then re-check from the top.
+            await asyncio.sleep(self._poll_interval)
+
+    async def _wake_group(self, group_id: str) -> None:
+        """Notify the journal worker pool that work may be available."""
+        self._notify_pool()
+        self._ensure_pool()
+
+    async def _journal_heartbeat_loop(self, row_id: int) -> None:
+        """Renew a claimed row's lease while its add_episode is in flight.
+
+        Runs as a side task per in-flight row and is cancelled once the row is
+        finished; the lease outlives a long LLM call, so the steward cannot
+        reclaim it and no two workers process the same episode.
+        """
+        interval = max(0.1, self._journal.lease_seconds / 2.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                alive = await self._journal.heartbeat(row_id, self._worker_id)
+                if not alive:
+                    logger.warning(
+                        'Lease lost on journal row %s (worker %s); stopping heartbeat',
+                        row_id,
+                        self._worker_id,
+                    )
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _journal_steward(self) -> None:
+        """Periodically requeue processing rows whose owner vanished.
+
+        Uses ``requeue_stale_except`` so rows owned by this process are never
+        stolen - long in-flight LLM calls are not double-processed; a vanished
+        owner's rows (lease expired beyond ``journal_grace_seconds``) are moved
+        back to pending and the pool is woken to retry them.
+        """
+        interval = max(1.0, float(self.resilience.journal_steward_interval_seconds))
+        while True:
+            if self._stopping:
+                return
+            await asyncio.sleep(interval)
+            try:
+                stolen = await self._journal.requeue_stale_except(
+                    self._worker_id, self.resilience.journal_grace_seconds
+                )
+                if stolen:
+                    logger.warning(
+                        'Lease steward requeued %d row(s) whose owner vanished',
+                        stolen,
+                    )
+                    self._notify_pool()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error('Lease steward error: %s', e)
+
+    def _notify_pool(self) -> None:
+        """Wake the journal pool: bump the generation and set the sticky event."""
+        self._wake_generation += 1
+        self._wake_event.set()
+
+    def _ensure_pool(self) -> None:
+        """Start the global journal worker pool (idempotent)."""
+        if self._pool_started or self._journal is None:
+            return
+        self._pool_started = True
+        n = max(1, int(self.resilience.journal_workers))
+        for i in range(1, n + 1):
+            task = asyncio.create_task(
+                self._journal_pool_worker(),
+                name=f'journal-pool-worker-{i}',
+            )
+            self._pool_tasks.append(task)
+        logger.info('Started %d journal pool worker(s)', n)
+
+    async def _handle_journal_failure(
+        self, group_id: str, row: dict[str, Any], exc: BaseException
+    ) -> None:
+        """React to a failed journal-processed episode: trip the breaker, back off.
+
+        Transient failures trip the breaker; the row is kept ``pending`` with an
+        exponential ``next_retry_at`` (the JournalRetryer alarm wakes the worker
+        when it is due). Exhausted rows are moved to ``failed`` like the spool.
+        """
+        transient = is_transient_error(exc) if self._breaker is not None else False
+        if transient and self._breaker is not None:
+            await self._breaker.record_failure(exc)
+
+        row_id = int(row['id'])
+        attempt = int(row.get('attempt', 0)) + 1
+        if attempt >= self.resilience.max_spool_attempts:
+            await self._journal.mark_failed(row_id, error=str(exc))
+            logger.error(
+                'Episode %s (name=%s) for group %s gave up after %d attempts: %s',
+                row.get('uuid'),
+                row.get('name'),
+                group_id,
+                attempt,
+                exc,
+            )
+            return
+
+        backoff = self.resilience.spool_backoff_base_seconds * (2 ** (attempt - 1))
+        next_retry_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=backoff)
+        ).isoformat()
+        await self._journal.bump_retry(
+            row_id, attempt=attempt, error=str(exc), next_retry_at=next_retry_at
+        )
+        logger.warning(
+            'Retry attempt %d/%d (backoff %.1fs) for episode %s (name=%s) group %s: %s',
+            attempt,
+            self.resilience.max_spool_attempts,
+            backoff,
+            row.get('uuid'),
+            row.get('name'),
+            group_id,
+            exc,
+        )
 
     async def _handle_processing_failure(
         self, group_id: str, plan: dict[str, Any] | None, exc: BaseException
@@ -241,7 +807,14 @@ class QueueService:
                 logger.error(f'Failed to spool episode {plan.get("uuid")}: {se}')
 
     def get_queue_size(self, group_id: str) -> int:
-        """Get the current queue size for a group_id."""
+        """Get the current queue size for a group_id.
+
+        Journal-backed: returns the last-known unfinished row count for the
+        group (authoritative async counts live in ``get_resilience_snapshot``
+        and the journal counters). Legacy: the in-memory queue size.
+        """
+        if self._journal is not None:
+            return self._journal_queue_sizes.get(group_id, 0)
         if group_id not in self._episode_queues:
             return 0
         return self._episode_queues[group_id].qsize()
@@ -259,7 +832,7 @@ class QueueService:
 
     def _any_busy(self) -> bool:
         """Whether any worker currently has an episode in flight."""
-        return any(self._busy.get(g, False) for g in self._episode_queues)
+        return any(c > 0 for c in self._busy_counts.values())
 
     async def drain(self, wait_current_seconds: float = 7.0) -> dict[str, Any]:
         """Spill every pending episode to the disk spool and drain in-flight work.
@@ -274,6 +847,37 @@ class QueueService:
         """
         self.begin_stopping()
         start = asyncio.get_running_loop().time()
+
+        if self._journal is not None:
+            # Journal-backed: pending rows are already durable in SQLite, so
+            # nothing is spilled. Give the in-flight episode a grace window to
+            # finish, then cancel overdue workers. A cancelled 'processing' row
+            # stays in the journal and is requeued by requeue_stale() on the
+            # next boot.
+            deadline = start + wait_current_seconds
+            while self._any_busy() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+            waited_seconds = asyncio.get_running_loop().time() - start
+
+            cancelled_workers: list[asyncio.Task] = []
+            if self._any_busy():
+                cancelled_workers = [t for t in self._pool_tasks if not t.done()]
+                for task in cancelled_workers:
+                    task.cancel()
+                if cancelled_workers:
+                    await asyncio.gather(*cancelled_workers, return_exceptions=True)
+
+            logger.warning(
+                'Graceful drain (journal): waited current %.1fs, cancelled %d overdue '
+                'worker(s); pending rows stay durable in the journal',
+                waited_seconds,
+                len(cancelled_workers),
+            )
+            return {
+                'spooled_pending': 0,
+                'waited_seconds': round(waited_seconds, 2),
+                'cancelled_workers': len(cancelled_workers),
+            }
 
         spooled_pending = 0
         for group_id in list(self._episode_queues):
@@ -313,7 +917,7 @@ class QueueService:
             cancelled_workers = [
                 task
                 for group_id, task in self._worker_tasks.items()
-                if self._busy.get(group_id, False) and not task.done()
+                if self._busy_counts.get(group_id, 0) > 0 and not task.done()
             ]
             for task in cancelled_workers:
                 task.cancel()
@@ -333,7 +937,14 @@ class QueueService:
         }
 
     def is_worker_running(self, group_id: str) -> bool:
-        """Check if a worker is running for a group_id."""
+        """Check if a worker is running for a group_id.
+
+        Journal-backed mode runs the global pool, which serves every group, so
+        this reports whether the pool is up; legacy mode reports the per-group
+        worker flag.
+        """
+        if self._journal is not None:
+            return self._pool_started
         return self._queue_workers.get(group_id, False)
 
     @property
@@ -346,33 +957,166 @@ class QueueService:
         """The episode spool persisting failed writes, if spooling is enabled."""
         return self._spool
 
-    async def initialize(self, graphiti_client: Any) -> None:
+    @property
+    def journal(self) -> QueueJournal | None:
+        """The durable SQLite journal backing the write path, if enabled."""
+        return self._journal
+
+    async def journal_search_raw(
+        self, query: str, *, limit: int = 20, include_done: bool = False
+    ) -> list[dict[str, Any]]:
+        """Search raw (not-yet-materialized) journal episodes by name/body.
+
+        Backs the ``search_raw_episodes`` MCP tool. Returns ``[]`` when the
+        journal is disabled - there is nothing to search - instead of raising,
+        so the read path never breaks a journal-off server. Passes the journal
+        rows through unchanged, so entries also carry the in-queue
+        ``verified_by``/``verified_at`` fact-check markers from ``search_raw``.
+        """
+        if self._journal is None:
+            return []
+        return await self._journal.search_raw(
+            query, limit=limit, include_done=include_done
+        )
+
+    async def initialize(
+        self,
+        graphiti_client: Any,
+        episode_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        llm_semaphore: asyncio.Semaphore | None = None,
+        journal_max_pending: int | None = None,
+    ) -> None:
         """Initialize the queue service with a graphiti client.
 
         Args:
             graphiti_client: The graphiti client instance to use for processing episodes
+            episode_builder: Rebuilds graphiti.add_episode kwargs from a persisted
+                journal plan. Required for journal-backed processing; set only when
+                resilience is enabled.
+            llm_semaphore: Optional shared cap on concurrent add_episode calls. When
+                omitted, a private semaphore sized from ``resilience.semaphore_limit``
+                is used; pass the server-wide semaphore so the journal pool and the
+                direct path share one LLM concurrency limit.
+            journal_max_pending: Optional soft ceiling for durable-journal intake
+                (pending+processing), overriding whatever the constructor/resilience
+                config resolved. ``None`` keeps the resolved value.
         """
         self._graphiti_client = graphiti_client
+        self._episode_builder = episode_builder
+        if journal_max_pending is not None:
+            self._journal_max_pending = journal_max_pending
+        if llm_semaphore is not None:
+            self._llm_semaphore = llm_semaphore
+
+        if self._journal is not None:
+            if self._episode_builder is None:
+                logger.warning(
+                    'Queue journal enabled but no episode_builder provided; '
+                    'journal rows cannot be processed until one is set'
+                )
+            # Heal hard-killed in-flight rows (kill -9): processing -> pending.
+            requeued = await self._journal.requeue_stale()
+            if requeued:
+                logger.warning(
+                    'Requeued %d stale processing row(s) from the journal (killed in flight)',
+                    requeued,
+                )
+            # Alarm: wakes workers when backed-off rows become due. It never
+            # ingests and never probes the breaker (cf. 680a069 fix).
+            retryer = JournalRetryer(
+                self._journal,
+                self._wake_group,
+                interval_seconds=self.resilience.retryer_interval_seconds,
+            )
+            retryer.start()
+            self._journal_retryer = retryer
+            # Start the global worker pool and pick up rows persisted by a
+            # previous process (or before workers existed) without waiting for
+            # the first new add_memory.
+            self._ensure_pool()
+            for group_id in await self._journal.distinct_groups_pending():
+                await self._wake_group(group_id)
+            # Lease steward: periodically reclaim rows whose owner vanished.
+            self._steward_task = asyncio.create_task(self._journal_steward())
+
         logger.info('Queue service initialized with graphiti client')
 
     async def get_resilience_snapshot(self) -> dict[str, Any]:
-        """Return a JSON-serializable snapshot of the resilience state."""
+        """Return a JSON-serializable snapshot of the resilience state.
+
+        Journal-backed: queue_depth and pending_episodes are read from the
+        journal table (correct after a restart), and a ``journal`` block is
+        included for /health.
+        """
         if self._breaker is not None:
             snapshot = await self._breaker.get_snapshot()
-            snapshot['queue_depth'] = self._queue_depth
         else:
             snapshot = {
                 'state': 'disabled',
                 'failure_count': 0,
                 'retry_after_seconds': 0.0,
                 'last_failure_ts': None,
-                'queue_depth': self._queue_depth,
             }
         snapshot['max_queue_depth'] = self.resilience.max_queue_depth
         snapshot['spool_enabled'] = self._spool is not None
-        snapshot['pending_episodes'] = self._spool.count_pending() if self._spool is not None else 0
+
+        if self._journal is not None:
+            stats = await self._journal.stats()
+            metrics = await self._journal.processing_stats(window_seconds=3600.0)
+            snapshot['queue_depth'] = stats['unfinished']
+            snapshot['pending_episodes'] = stats['pending']
+            snapshot['journal'] = {
+                'enabled': True,
+                'path': str(self._journal.db_path),
+                # Soft ceiling for journal intake (pending+processing), decoupled
+                # from the legacy in-memory max_queue_depth (20).
+                'max_pending': self._journal_max_pending,
+                **stats,
+                'processed_1h': metrics['processed'],
+                'avg_processing_seconds': metrics['avg_processing_seconds'],
+                # Active multi-model failover list (resilience.model_fallbacks).
+                'fallbacks': list(self.resilience.model_fallbacks),
+                # Raw (not-yet-materialized) episode search is available while
+                # the journal is on; /health surfaces this so clients can gate
+                # the search_raw_episodes tool.
+                'search': True,
+                # Phase 4: per-model reputation (429 / empty / transient /
+                # success counters + healthy flag) for the /health block.
+                'per_model': self._reputation.per_model_stats(),
+            }
+        else:
+            snapshot['queue_depth'] = self._queue_depth
+            snapshot['pending_episodes'] = self._spool.count_pending() if self._spool is not None else 0
+            snapshot['journal'] = {'enabled': False, 'search': False}
         snapshot['stopping'] = self._stopping
         return snapshot
+
+    async def close(self) -> None:
+        """Stop the journal alarm and pool, then close the journal connection."""
+        if self._journal_retryer is not None:
+            try:
+                await self._journal_retryer.stop()
+            except Exception as e:
+                logger.error('Failed to stop journal retryer during shutdown: %s', e)
+            self._journal_retryer = None
+        # Stop the lease steward before canceling the pool that might feed it.
+        if self._steward_task is not None:
+            self._steward_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._steward_task
+            self._steward_task = None
+        # Cancel pool workers before closing the journal underneath them.
+        if self._pool_tasks:
+            for task in self._pool_tasks:
+                task.cancel()
+            await asyncio.gather(*self._pool_tasks, return_exceptions=True)
+            self._pool_tasks = []
+            self._pool_started = False
+        if self._journal is not None:
+            try:
+                await self._journal.close()
+            except Exception as e:
+                logger.error('Failed to close journal at %s: %s', self._journal.db_path, e)
 
     async def add_episode(
         self,

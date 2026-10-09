@@ -165,6 +165,10 @@ Core tools:
 - build_communities: detect entity communities and produce higher-level community summaries.
 - get_episode_entities: trace provenance — the entities and facts created by specific episode UUIDs.
 - get_entity_edge / get_episodes: retrieve specific facts or episodes.
+- search_raw_episodes: search the durable write-ahead journal for raw,
+  not-yet-materialized episodes (visible immediately after add_memory is
+  accepted, before background extraction finishes) - available when the
+  resilience journal is enabled.
 - delete_episode: remove an episode and cascade-delete the entities/facts it solely created.
 - delete_entity_edge / clear_graph: remove a fact, or clear a group's data.
 
@@ -913,6 +917,72 @@ async def get_episodes(
 
 
 @mcp.tool()
+async def search_raw_episodes(
+    query: str,
+    limit: int = 20,
+    include_done: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Search raw, not-yet-materialized episodes in the durable write-ahead journal.
+
+    An episode is visible here immediately after ``add_memory`` was accepted -
+    before the background extraction has written it into the graph - so parsing
+    is never a blocker for finding a submitted episode. Matching is
+    case-insensitive over the episode name and body (LIKE; user wildcards are
+    escaped). Rows come back newest-first; ``done`` entries are excluded unless
+    ``include_done`` is true. Every result carries ``materialized: False`` - the
+    journal is not the graph.
+
+    Only available when the resilience journal is enabled. When it is disabled
+    the tool returns a structured ``{type, error, message, entries}`` response
+    (never crashes the server).
+
+    Args:
+        query: Substring to match against an episode's name or body.
+        limit: Maximum number of entries to return (default: 20).
+        include_done: When True, finished episodes are searched too.
+
+    Returns:
+        A list of ``{id, status, group_id, name, snippet, created_at, updated_at,
+        verified_by, verified_at, materialized}`` dicts, or a structured error
+        dict when the journal is off.
+    """
+    global queue_service
+
+    if queue_service is None:
+        return {
+            'type': 'search_raw_episodes',
+            'error': 'Services not initialized',
+            'entries': [],
+        }
+
+    # Raw search reads the durable journal; without it there is nothing to
+    # search and the tool degrades gracefully instead of failing.
+    if queue_service.journal is None:
+        return {
+            'type': 'search_raw_episodes',
+            'error': 'journal disabled',
+            'message': (
+                'Raw episode search unavailable: the durable SQLite journal is '
+                'disabled (set resilience.journal_enabled to enable it)'
+            ),
+            'entries': [],
+        }
+
+    try:
+        return await queue_service.journal_search_raw(
+            query, limit=limit, include_done=include_done
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error searching raw episodes: {error_msg}')
+        return {
+            'type': 'search_raw_episodes',
+            'error': f'Error searching raw episodes: {error_msg}',
+            'entries': [],
+        }
+
+
+@mcp.tool()
 async def summarize_saga(
     saga_name: str, group_id: str | None = None
 ) -> SagaSummaryResponse | ErrorResponse:
@@ -1231,6 +1301,7 @@ async def health_check(request) -> JSONResponse:
         body['max_queue_depth'] = snapshot.get('max_queue_depth', 20)
         body['pending_episodes'] = snapshot.get('pending_episodes', 0)
         body['retry_after_seconds'] = snapshot.get('retry_after_seconds', 0)
+        body['journal'] = snapshot.get('journal', {'enabled': False})
         if snapshot.get('state') in ('open', 'half_open'):
             body['status'] = 'degraded'
 
@@ -1370,20 +1441,17 @@ async def initialize_server() -> ServerConfig:
     graphiti_client = await graphiti_service.get_client()
     semaphore = graphiti_service.semaphore
 
-    # Initialize queue service with the client
-    await queue_service.initialize(graphiti_client)
+    # Initialize queue service with the client. The episode_builder rebuilds
+    # graphiti.add_episode kwargs from a persisted plan (complex structures are
+    # not persisted and are rebuilt from the live service), and is shared by the
+    # journal-backed workers and the legacy spool retryer. The server-wide
+    # semaphore bounds concurrent add_episode across both the journal pool and
+    # the direct path.
+    episode_builder = None
 
-    # Start the spool retryer if resilience is enabled.
-    if config.resilience.enabled and config.resilience.spool_enabled and queue_service.spool is not None:
-        resilience = config.resilience
-
-        def episode_builder(plan: dict[str, Any]) -> dict[str, Any]:
-            """Rebuild graphiti.add_episode kwargs from a persisted spool plan.
-
-            Complex structures (entity_types/edge_types/edge_type_map and the
-            EpisodeType enum) are not persisted; they are rebuilt from the live
-            service, mirroring what add_memory passes at queued time.
-            """
+    def _build_episode_builder():
+        def _episode_builder(plan: dict[str, Any]) -> dict[str, Any]:
+            """Rebuild graphiti.add_episode kwargs from a persisted plan."""
             ref = parse_reference_time(plan.get('reference_time'))
             return {
                 'name': plan['name'],
@@ -1403,6 +1471,28 @@ async def initialize_server() -> ServerConfig:
                 'saga_previous_episode_uuid': plan.get('saga_previous_episode_uuid'),
                 'uuid': plan.get('uuid'),
             }
+
+        return _episode_builder
+
+    if config.resilience.enabled:
+        episode_builder = _build_episode_builder()
+
+    await queue_service.initialize(
+        graphiti_client, episode_builder=episode_builder, llm_semaphore=semaphore
+    )
+
+    if queue_service.journal is not None:
+        logger.info(
+            'Durable SQLite journal enabled (path=%s, lease=%ss)',
+            queue_service.journal.db_path,
+            config.resilience.journal_lease_seconds,
+        )
+    else:
+        logger.info('Durable SQLite journal disabled')
+
+    # Start the spool retryer if resilience is enabled.
+    if config.resilience.enabled and config.resilience.spool_enabled and queue_service.spool is not None:
+        resilience = config.resilience
 
         episode_retryer = EpisodeRetryer(
             spool=queue_service.spool,

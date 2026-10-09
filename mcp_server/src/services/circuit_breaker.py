@@ -134,6 +134,9 @@ class CircuitBreaker:
     Only one probe is allowed through while half-open: ``allow_request()`` lets a
     single episode proceed (setting ``_probe_in_flight``) and rejects any further
     submissions until that probe resolves via ``record_success``/``record_failure``.
+    A probe that is not resolved within ``probe_timeout_seconds`` is re-granted on
+    the next ``allow_request()`` so a consumed-but-forgotten probe cannot strand
+    the breaker in half_open forever.
 
     All state mutations are guarded by an ``asyncio.Lock`` and, by default, by a
     monotonic clock (``time_fn``).
@@ -144,10 +147,12 @@ class CircuitBreaker:
         failure_threshold: int = 3,
         open_timeout_seconds: float = 30.0,
         *,
+        probe_timeout_seconds: float = 60.0,
         time_fn=None,
     ):
         self.failure_threshold = max(1, int(failure_threshold))
         self.open_timeout_seconds = float(open_timeout_seconds)
+        self.probe_timeout_seconds = float(probe_timeout_seconds)
         self._time_fn = time_fn or time.monotonic
 
         self._lock = asyncio.Lock()
@@ -158,6 +163,7 @@ class CircuitBreaker:
         self._last_failure_ts: float | None = None
         self._last_retry_after: float | None = None
         self._probe_in_flight = False
+        self._probe_granted_ts: float | None = None
 
     @property
     def state(self) -> str:
@@ -196,10 +202,24 @@ class CircuitBreaker:
                 if elapsed >= retry_after:
                     self._state = 'half_open'
                     self._probe_in_flight = True
+                    self._probe_granted_ts = self._time_fn()
                     return True
                 return False
             if self._state == 'half_open' and self._probe_in_flight:
-                # A probe is already running; do not allow a second one.
+                # A probe is already running; do not allow a second one — unless
+                # it was granted so long ago that its caller must have vanished
+                # without calling record_success/record_failure (e.g. the spool
+                # retryer probed with nothing to replay). Re-grant the slot so a
+                # lost probe cannot strand the breaker in half_open forever.
+                probe_age = self._time_fn() - (self._probe_granted_ts or 0.0)
+                if probe_age >= self.probe_timeout_seconds:
+                    logger.warning(
+                        'Half-open probe unresolved for %.1fs (timeout %.1fs), re-granting the probe slot',
+                        probe_age,
+                        self.probe_timeout_seconds,
+                    )
+                    self._probe_granted_ts = self._time_fn()
+                    return True
                 return False
             return True
 
@@ -248,6 +268,7 @@ class CircuitBreaker:
         self._last_failure_ts = None
         self._last_retry_after = None
         self._probe_in_flight = False
+        self._probe_granted_ts = None
 
     async def get_snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot of breaker state."""

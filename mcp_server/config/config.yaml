@@ -144,6 +144,12 @@ graphiti:
 # resilience:
 #   enabled: true
 #   max_queue_depth: 20
+#   # Soft ceiling for durable-journal intake (pending+processing), decoupled from
+#   # max_queue_depth (the legacy in-memory limit of 20, which protects RAM). Journal
+#   # rows live durably on disk, so a wider ceiling is safe: backpressure still kicks
+#   # in at pending+processing >= journal_max_pending (+ enqueue_breakthrough_max_pending
+#   # while the circuit is open), just without the narrow in-memory bottleneck.
+#   journal_max_pending: 500
 #   failure_threshold: 3
 #   open_timeout_seconds: 30
 #   spool_enabled: true
@@ -151,3 +157,48 @@ graphiti:
 #   retryer_interval_seconds: 15
 #   spool_backoff_base_seconds: 30
 #   max_spool_attempts: 10
+#   # Durable SQLite write-ahead journal: when enabled, add_memory first writes
+#   # each episode plan to the journal DB (WAL) and workers claim rows from it,
+#   # so queued episodes survive a hard kill (SIGKILL) without loss. Backpressure
+#   # and /health counts are read from journal rows, correct after a restart.
+#   journal_enabled: true
+#   journal_path: "~/.graphiti/journal.db"   # contains private episode content - keep ignored
+#   journal_lease_seconds: 300.0
+#   # Global journal worker pool size (phase 2): workers may claim from any
+#   # group, but a per-group lock keeps each group strictly FIFO, so this only
+#   # adds cross-group concurrency. Serial zones (no previous_episode_uuids,
+#   # saga without saga_previous_episode_uuid, update_communities) are never
+#   # parallelized.
+#   journal_workers: 4
+#   # Global cap on concurrent graphiti.add_episode calls (LLM extraction +
+#   # graph write), shared by the journal pool and the direct add_memory path.
+#   semaphore_limit: 10
+#   # Lease steward: how often to reclaim processing rows whose owner vanished,
+#   # and how far past an expired lease a row must be before another worker may
+#   # take it. Rows owned by the live process are never stolen, so long in-flight
+#   # LLM calls are never double-processed.
+#   journal_steward_interval_seconds: 15
+#   journal_grace_seconds: 60
+#   # Multi-model failover (phase 3): ordered fallback LLM models (gateway IDs)
+#   # tried by the journal worker when the active extraction model (llm.model)
+#   # fails transiently for an episode (RateLimitError / empty response / 5xx).
+#   # The whole episode is processed by ONE chosen model (graph consistency);
+#   # fallbacks use the same max_tokens as llm.max_tokens. Order matters: the
+#   # first not-yet-attempted model wins. An empty list disables failover.
+#   # Cutover requires canary trials of the candidate on real long episodes
+#   # (see ~/docs/research/graphiti-model-failover*.md).
+#   model_fallbacks:
+#     - "AgentLLM-default"
+#   # Phase 4 - bounded breakthrough intake + per-model routing. While the breaker
+#   # is OPEN, allow up to max_queue_depth + enqueue_breakthrough_max_pending new
+#   # episodes so canaries / critical episodes still reach the durable journal and
+#   # drain on a live fallback (per-model reputation prefers healthy channels).
+#   # 0 keeps the default (open breaker rejects everything). Only meaningful
+#   # together with a non-empty model_fallbacks - with no fallback a breakthrough
+#   # just accumulates rows with nowhere to drain.
+#   enqueue_breakthrough_max_pending: 5
+#   # Per-model reputation window / 429 thresholds used to reorder failover
+#   # candidates: healthy (live) channels are tried before a 429-storming primary.
+#   model_reputation_window_seconds: 300.0
+#   model_reputation_429_per_min_threshold: 5.0
+#   model_reputation_429_cooldown_seconds: 60.0

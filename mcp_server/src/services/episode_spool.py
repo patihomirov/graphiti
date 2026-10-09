@@ -221,17 +221,26 @@ class EpisodeRetryer:
             logger.info('Episode retryer cancelled')
 
     async def _tick(self) -> None:
-        # Do not burn attempts while the breaker is open.
-        if self.breaker is not None and not await self.breaker.allow_request():
-            return
+        # Collect episodes that are actually due for a replay BEFORE probing the
+        # breaker: allow_request() consumes the single half-open probe slot, and a
+        # probe granted with nothing to replay would never be resolved by
+        # record_success/record_failure, leaving the breaker stuck in half_open
+        # and rejecting every new submission until a restart.
+        due: list[tuple[Path, dict[str, Any]]] = []
         for path in self.spool.list_pending():
             try:
                 plan = self.spool.load(path)
             except (OSError, json.JSONDecodeError) as e:
                 logger.error('Skipping unreadable spool file %s: %s', path, e)
                 continue
-            if not self._due_for(plan):
-                continue
+            if self._due_for(plan):
+                due.append((path, plan))
+        if not due:
+            return
+        # Do not burn attempts while the breaker is open.
+        if self.breaker is not None and not await self.breaker.allow_request():
+            return
+        for path, plan in due:
             await self._process_one(path, plan)
 
     def _due_for(self, plan: dict[str, Any]) -> bool:
@@ -257,8 +266,14 @@ class EpisodeRetryer:
             raise
         except Exception as e:
             transient = is_transient_error(e)
-            if transient and self.breaker is not None:
-                await self.breaker.record_failure(e)
+            if self.breaker is not None:
+                if transient:
+                    await self.breaker.record_failure(e)
+                else:
+                    # A permanent failure is not evidence of provider trouble,
+                    # but it must still resolve the probe slot this tick may have
+                    # consumed, otherwise the breaker sticks in half_open.
+                    await self.breaker.record_success()
             attempt = int(plan.get('attempt', 0)) + 1
             plan['attempt'] = attempt
             logger.warning(
@@ -275,5 +290,10 @@ class EpisodeRetryer:
                 self.spool.update_attempt(plan, reason=str(e))
             return
 
+        # The replay succeeded — resolve the probe this tick may have consumed so
+        # the breaker closes instead of sticking in half_open with the probe slot
+        # held forever.
+        if self.breaker is not None:
+            await self.breaker.record_success()
         self.spool.delete(path)
         logger.info('Retried spooled episode %s (name=%s) successfully', plan.get('uuid'), plan.get('name'))

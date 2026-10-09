@@ -283,11 +283,26 @@ class ResilienceConfig(BaseModel):
     max_queue_depth: int = Field(
         default=20, description='Max total queued episodes across all group_ids before fail-fast'
     )
+    journal_max_pending: int = Field(
+        default=500,
+        ge=0,
+        description='Soft ceiling for durable-journal intake (pending+processing), '
+        'decoupled from max_queue_depth (the legacy in-memory limit). Journal rows '
+        'live on disk and survive restarts, so a wider ceiling is safe: backpressure '
+        'triggers at pending+processing >= journal_max_pending (plus '
+        'enqueue_breakthrough_max_pending while the circuit is open) instead of the '
+        'RAM-protecting 20 of the in-memory queue.',
+    )
     failure_threshold: int = Field(
         default=3, description='Consecutive transient failures to trip the breaker open'
     )
     open_timeout_seconds: float = Field(
         default=30.0, description='Cooldown before the breaker tries a half-open probe'
+    )
+    probe_timeout_seconds: float = Field(
+        default=60.0,
+        description='A half-open probe not resolved within this time is re-granted '
+        '(guards against a consumed-but-forgotten probe stranding the breaker)',
     )
     spool_enabled: bool = Field(default=True, description='Enable disk spooling of failed episodes')
     spool_dir: str = Field(
@@ -302,6 +317,92 @@ class ResilienceConfig(BaseModel):
     )
     max_spool_attempts: int = Field(
         default=10, description='Max retry attempts before an episode is moved to failed/'
+    )
+    journal_enabled: bool = Field(
+        default=False,
+        description='Enable the durable SQLite write-ahead journal as the source of truth '
+        'for the episode write path. When enabled, every episode plan is written to the '
+        'journal DB before processing and workers claim rows from it, so episodes survive '
+        'hard kills (SIGKILL) instead of being lost with the in-memory queue.',
+    )
+    journal_path: str | None = Field(
+        default=None,
+        description='Path to the SQLite journal DB. Defaults to ~/.graphiti/journal.db '
+        'when journal_enabled.',
+    )
+    journal_lease_seconds: float = Field(
+        default=300.0,
+        description='Worker lease duration for claimed journal rows. A processing row '
+        'whose lease_until has passed is considered stale and requeued on startup '
+        '(heals hard-killed in-flight episodes).',
+    )
+    journal_workers: int = Field(
+        default=1,
+        ge=1,
+        description='Size of the global journal worker pool. Workers claim rows from '
+        'any group; a per-group processing lock keeps each group strictly FIFO, so the '
+        'pool size bounds cross-group concurrency without ever parallelizing within a '
+        'group (which would break previous-episode context ordering).',
+    )
+    semaphore_limit: int = Field(
+        default=10,
+        ge=1,
+        description='Global cap on concurrent graphiti.add_episode calls (the LLM '
+        'extraction + graph write). Shared by the journal worker pool and the direct '
+        'add_memory path via the server-wide semaphore.',
+    )
+    journal_steward_interval_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        description='Interval at which the lease steward scans for processing rows '
+        'whose owner vanished. The steal guard never touches rows owned by the '
+        'current worker, so long in-flight LLM calls are never double-processed.',
+    )
+    journal_grace_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        description='How far past an expired lease a processing row must be before '
+        'another worker may reclaim it.',
+    )
+    model_fallbacks: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Ordered fallback LLM models (gateway model IDs) tried by the journal '
+            'worker when the active extraction model (llm.model) fails transiently '
+            '(RateLimitError / EmptyResponseError / transport error). Order matters: '
+            'the first not-yet-attempted model wins. Fallbacks use the same '
+            'max_tokens as llm.max_tokens. Empty list = failover off.'
+        ),
+    )
+    enqueue_breakthrough_max_pending: int = Field(
+        default=0,
+        ge=0,
+        description='How many episodes may be enqueued past max_queue_depth while '
+        'the circuit breaker is OPEN (bounded breakthrough intake). A value of 0 '
+        'keeps the current behaviour: an open breaker rejects every new episode. '
+        'With a value >0 and a configured model_fallbacks, canaries and critical '
+        'episodes still reach the durable journal during a 429 storm and drain on '
+        'a live fallback channel instead of being rejected with '
+        'graphiti_backpressure:.',
+    )
+    model_reputation_window_seconds: float = Field(
+        default=300.0,
+        ge=1.0,
+        description='Sliding-window length (seconds) for per-model reputation '
+        'tracking. 429 / empty / transient / success events older than the window '
+        'are pruned.',
+    )
+    model_reputation_429_per_min_threshold: float = Field(
+        default=5.0,
+        ge=0.0,
+        description='A model is treated as unhealthy when its 429 rate over the '
+        'reputation window exceeds this many events per minute.',
+    )
+    model_reputation_429_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=0.0,
+        description='A 429 seen within this many seconds marks the model unhealthy '
+        'regardless of 429 rate (fresh rate-limit avoidance).',
     )
 
 
