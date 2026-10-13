@@ -112,6 +112,12 @@ class QueueService:
         # Periodic lease steward (phase 2): requeues rows whose owner vanished,
         # while never stealing this process's own in-flight rows.
         self._steward_task: asyncio.Task | None = None
+        # Absolute budget for one add_episode call inside the journal worker
+        # (per model attempt). A hung LLM call past this is aborted so a wedged
+        # serial group is released to retry instead of stranding for hours.
+        self._journal_processing_timeout = float(
+            self.resilience.journal_processing_timeout_seconds
+        )
 
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
@@ -381,6 +387,9 @@ class QueueService:
         # Keep the lease fresh for long in-flight LLM calls so the steward never
         # steals our own row; cancelled in ``finally`` once the row is done.
         heartbeat = asyncio.create_task(self._journal_heartbeat_loop(row['id']))
+        # Heal our OWN row when its lease goes stale (heartbeat died / add_episode
+        # hung past reason); cancelled with the heartbeat once the row is done.
+        watchdog = asyncio.create_task(self._journal_watchdog_loop(row['id']))
         try:
             plan = json.loads(row['plan_json'])
             if self._episode_builder is None:  # guarded by caller, defensive
@@ -399,13 +408,14 @@ class QueueService:
         except Exception as e:
             await self._handle_journal_failure(group_id, row, e)
         else:
-            await self._journal.mark_done(row['id'])
+            await self._journal.mark_done(row['id'], self._worker_id)
             if self._breaker is not None:
                 await self._breaker.record_success()
         finally:
             heartbeat.cancel()
+            watchdog.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+                await asyncio.gather(heartbeat, watchdog, return_exceptions=True)
             count = self._busy_counts.get(group_id, 0) - 1
             if count > 0:
                 self._busy_counts[group_id] = count
@@ -450,9 +460,15 @@ class QueueService:
                 setter(model)
             try:
                 # LLM + graph write is the scarce resource shared with the direct
-                # path: hold the global semaphore around the actual call.
+                # path: hold the global semaphore around the actual call. A hung
+                # call past ``_journal_processing_timeout`` is aborted so a wedged
+                # LLM fetch cannot strand this serial group; the row goes to
+                # retry (backoff) via the standard failure path below.
                 async with self._llm_semaphore:
-                    await self._graphiti_client.add_episode(**kwargs)
+                    await asyncio.wait_for(
+                        self._graphiti_client.add_episode(**kwargs),
+                        timeout=self._journal_processing_timeout,
+                    )
                 self._record_reputation(model, None)  # success
                 return
             except asyncio.CancelledError:
@@ -690,6 +706,46 @@ class QueueService:
         except asyncio.CancelledError:
             return
 
+    async def _journal_watchdog_loop(self, row_id: int) -> None:
+        """Heal THIS worker's own processing row when its lease goes stale.
+
+        The steward's steal guard deliberately never touches our own rows (a long
+        in-flight LLM call must not be double-processed), so a live worker has to
+        clean up its own mess: if the heartbeat task died, or add_episode hangs
+        past reason without renewing the lease, this watchdog requeues the row
+        back to ``pending`` (attempt+1) instead of stranding it in ``processing``
+        until a restart. Runs as a side task next to the heartbeat task and is
+        cancelled with it once the row is finished.
+
+        It never fights a live heartbeat: the sleep window is
+        ``lease_seconds + grace`` and the requeue is gated on an expired lease,
+        so while the heartbeat renews the lease the check is a cheap no-op and
+        the loop keeps watching. The claim is re-checked by
+        ``requeue_own_stale`` (id + worker_id + status), so a row that was
+        concurrently finished or reclaimed by another worker is never touched.
+        """
+        grace = float(self.resilience.journal_grace_seconds)
+        interval = max(1.0, float(self._journal.lease_seconds) + grace)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                healed = await self._journal.requeue_own_stale(
+                    row_id, self._worker_id, grace
+                )
+                if healed:
+                    logger.warning(
+                        'watchdog: requeued own stale row %s (lease expired '
+                        'while this worker still ran; retrying)',
+                        row_id,
+                    )
+                    self._notify_pool()
+                    return
+                if not await self._journal.row_owned(row_id, self._worker_id):
+                    # The row finished / moved on; nothing left to watch.
+                    return
+        except asyncio.CancelledError:
+            return
+
     async def _journal_steward(self) -> None:
         """Periodically requeue processing rows whose owner vanished.
 
@@ -753,7 +809,7 @@ class QueueService:
         row_id = int(row['id'])
         attempt = int(row.get('attempt', 0)) + 1
         if attempt >= self.resilience.max_spool_attempts:
-            await self._journal.mark_failed(row_id, error=str(exc))
+            await self._journal.mark_failed(row_id, error=str(exc), worker_id=self._worker_id)
             logger.error(
                 'Episode %s (name=%s) for group %s gave up after %d attempts: %s',
                 row.get('uuid'),
@@ -769,7 +825,11 @@ class QueueService:
             datetime.now(timezone.utc) + timedelta(seconds=backoff)
         ).isoformat()
         await self._journal.bump_retry(
-            row_id, attempt=attempt, error=str(exc), next_retry_at=next_retry_at
+            row_id,
+            attempt=attempt,
+            error=str(exc),
+            next_retry_at=next_retry_at,
+            worker_id=self._worker_id,
         )
         logger.warning(
             'Retry attempt %d/%d (backoff %.1fs) for episode %s (name=%s) group %s: %s',

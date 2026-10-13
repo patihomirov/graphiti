@@ -8,6 +8,7 @@ against a tmp_path SQLite DB with no network and no graphiti-core data.
 """
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 from unittest.mock import AsyncMock
@@ -450,6 +451,31 @@ async def wait_until(predicate, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.02)
 
 
+def expire_lease(db_path: str, row_id: int) -> None:
+    """Force a row's lease into the distant past (simulates a dead heartbeat)."""
+    cur = sqlite3.connect(db_path)
+    try:
+        cur.execute(
+            "UPDATE episode_queue SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (row_id,),
+        )
+        cur.commit()
+    finally:
+        cur.close()
+
+
+def fetch_row(db_path: str, row_id: int) -> sqlite3.Row:
+    "Fetch a journal row by id (raw sqlite read, like the existing stale tests)."
+    cur = sqlite3.connect(db_path)
+    cur.row_factory = sqlite3.Row
+    try:
+        return cur.execute(
+            'SELECT * FROM episode_queue WHERE id=?', (row_id,)
+        ).fetchone()
+    finally:
+        cur.close()
+
+
 class TestSerialPolicyAndLease:
     """Phase 2: serial-zone flag, leader claim guard, lease heartbeat/steward."""
 
@@ -598,6 +624,94 @@ class TestSerialPolicyAndLease:
             await j.mark_done(row_id)
         finally:
             await j.close()
+
+
+class TestWatchdogHotRequeue:
+    """Hot self-requeue: a LIVE worker heals its OWN stale processing row.
+
+    Regression for the "stranded processing row" incident: with a live worker the
+    steward's steal guard never touches its own rows, so previously the only way a
+    wedged row was released was ``requeue_stale()`` on the next boot. The watchdog
+    returns such a row to ``pending`` in-place (attempt+1), and never touches a
+    row owned by a different worker.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_requeue_own_stale_heals_own_row_keeps_foreign(self, journal):
+        my_worker = 'p-me'
+        await journal.enqueue(make_plan(uuid='wd-own'))
+        own = await journal.claim_next('g1', my_worker)
+        row_id = own['id']
+        # Fresh lease: the watchdog must NOT requeue a live, heartbeating row.
+        assert await journal.requeue_own_stale(row_id, my_worker, grace_seconds=1) is False
+        # Heartbeat died (lease forced into the past): our own row is healed.
+        expire_lease(journal.db_path, row_id)
+        assert await journal.requeue_own_stale(row_id, my_worker, grace_seconds=1) is True
+        row = fetch_row(journal.db_path, row_id)
+        assert row['status'] == 'pending'
+        assert row['worker_id'] is None
+        assert row['lease_until'] is None
+        assert row['attempt'] == 1
+        # A row owned by a DIFFERENT worker is never touched by our self-heal
+        # (steal guard preserved): the watchdog works strictly on its own row.
+        await journal.enqueue(make_plan(uuid='wd-foreign'))
+        foreign = await journal.claim_next('g1', 'p-other')
+        f_id = foreign['id']
+        expire_lease(journal.db_path, f_id)
+        assert await journal.requeue_own_stale(f_id, my_worker, grace_seconds=1) is False
+        assert fetch_row(journal.db_path, f_id)['status'] == 'processing'
+        # Claim by the original owner now also fails guard: row already requeued.
+        assert await journal.requeue_own_stale(row_id, my_worker, grace_seconds=1) is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_watchdog_requeues_own_stale_row_without_restart(self, tmp_path):
+        cfg = ResilienceConfig(
+            journal_enabled=True,
+            journal_path=str(tmp_path / 'wd-svc.db'),
+            journal_lease_seconds=1.0,
+            journal_grace_seconds=1.0,
+            spool_enabled=False,
+        )
+        service = QueueService(cfg)
+        j = service._journal
+        try:
+            # Own row whose heartbeat is dead: the watchdog must requeue it to
+            # pending WITHOUT a restart, after lease_seconds + grace elapse.
+            await j.enqueue(make_plan(uuid='wd-svc-1'))
+            own = await j.claim_next('g1', service._worker_id)
+            row_id = own['id']
+            expire_lease(j.db_path, row_id)
+            task = asyncio.create_task(service._journal_watchdog_loop(row_id))
+            await wait_until(
+                lambda: fetch_row(j.db_path, row_id)['status'] == 'pending',
+                timeout=10.0,
+            )
+            row = fetch_row(j.db_path, row_id)
+            assert row['worker_id'] is None
+            assert row['lease_until'] is None
+            assert row['attempt'] == 1
+            assert row['error'] == 'requeued own stale lease'
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+            # A row owned by a DIFFERENT worker stays untouched by our watchdog
+            # (steal guard preserved across the hot-requeue too).
+            await j.enqueue(make_plan(uuid='wd-svc-2'))
+            foreign = await j.claim_next('g1', 'p-other')
+            f_id = foreign['id']
+            expire_lease(j.db_path, f_id)
+            task2 = asyncio.create_task(service._journal_watchdog_loop(f_id))
+            # Longer than the watchdog interval (lease 1.0 + grace 1.0 = 2.0s).
+            await asyncio.sleep(2.4)
+            assert fetch_row(j.db_path, f_id)['status'] == 'processing'
+            task2.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task2
+        finally:
+            await service.close()
 
 
 class TestSearchRaw:

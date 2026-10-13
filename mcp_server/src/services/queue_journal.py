@@ -409,11 +409,30 @@ class QueueJournal:
             self._conn.rollback()
             raise
 
-    async def mark_done(self, row_id: int) -> None:
-        await self._execute(
-            "UPDATE episode_queue SET status='done', updated_at=? WHERE id=?",
-            (_now_iso(), row_id),
-        )
+    async def mark_done(self, row_id: int, worker_id: str | None = None) -> bool:
+        """Mark a claimed row ``done`` (claim-aware when ``worker_id`` is given).
+
+        Without ``worker_id`` behaves as before (id only). With ``worker_id`` the
+        update is gated on the row still being THIS worker's in-flight row, so a
+        late result from an already-requeued/reclaimed row (watchdog) can never
+        mark ``done`` a fresh claim it no longer owns.
+
+        Returns ``True`` when the row was updated, ``False`` otherwise.
+        """
+        if worker_id is None:
+            sql = "UPDATE episode_queue SET status='done', updated_at=? WHERE id=?"
+            params = (_now_iso(), row_id)
+        else:
+            sql = (
+                "UPDATE episode_queue SET status='done', updated_at=? "
+                "WHERE id=? AND status='processing' AND worker_id=?"
+            )
+            params = (_now_iso(), row_id, worker_id)
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync, self._conn, sql, params
+            )
+            return cur.rowcount > 0
 
     async def bump_retry(
         self,
@@ -421,20 +440,57 @@ class QueueJournal:
         attempt: int,
         error: str,
         next_retry_at: str,
-    ) -> None:
+        worker_id: str | None = None,
+    ) -> bool:
         """Keep a failed row pending for a later retry (exponential backoff).
 
         ``attempted_models`` is reset to NULL here: a backoff interval is the
         release point for the 429 storm, so the next claim restarts from the
         active model instead of replaying the previously failed chain.
+
+        When ``worker_id`` is given the retry is claim-aware: the update is gated
+        on the row still being owned by that worker, so a late failure from an
+        already-requeued row (watchdog) is a no-op instead of clobbering a fresh
+        claim. Returns ``True`` when the row was updated, ``False`` otherwise.
         """
-        await self._execute(
-            "UPDATE episode_queue SET status='pending', attempt=?, error=?, "
-            "next_retry_at=?, worker_id=NULL, lease_until=NULL, attempted_models=NULL, "
-            "first_failure_ts=COALESCE(first_failure_ts, ?), last_attempt_ts=?, updated_at=? "
-            'WHERE id=?',
-            (attempt, error, next_retry_at, _now_iso(), _now_iso(), _now_iso(), row_id),
-        )
+        if worker_id is None:
+            sql = (
+                "UPDATE episode_queue SET status='pending', attempt=?, error=?, "
+                "next_retry_at=?, worker_id=NULL, lease_until=NULL, attempted_models=NULL, "
+                "first_failure_ts=COALESCE(first_failure_ts, ?), last_attempt_ts=?, updated_at=? "
+                'WHERE id=?'
+            )
+            params = (
+                attempt,
+                error,
+                next_retry_at,
+                _now_iso(),
+                _now_iso(),
+                _now_iso(),
+                row_id,
+            )
+        else:
+            sql = (
+                "UPDATE episode_queue SET status='pending', attempt=?, error=?, "
+                "next_retry_at=?, worker_id=NULL, lease_until=NULL, attempted_models=NULL, "
+                "first_failure_ts=COALESCE(first_failure_ts, ?), last_attempt_ts=?, updated_at=? "
+                "WHERE id=? AND status='processing' AND worker_id=?"
+            )
+            params = (
+                attempt,
+                error,
+                next_retry_at,
+                _now_iso(),
+                _now_iso(),
+                _now_iso(),
+                row_id,
+                worker_id,
+            )
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync, self._conn, sql, params
+            )
+            return cur.rowcount > 0
 
     async def get_attempted_models(self, row_id: int) -> list[str]:
         """Return the model IDs already attempted for a row (JSON column)."""
@@ -489,13 +545,32 @@ class QueueJournal:
             )
             return cur.rowcount > 0
 
-    async def mark_failed(self, row_id: int, error: str) -> None:
-        """Move an exhausted row to failed/ for manual re-add (analogous to the spool)."""
-        await self._execute(
-            "UPDATE episode_queue SET status='failed', error=?, worker_id=NULL, "
-            'lease_until=NULL, updated_at=? WHERE id=?',
-            (error, _now_iso(), row_id),
-        )
+    async def mark_failed(self, row_id: int, error: str, worker_id: str | None = None) -> bool:
+        """Move an exhausted row to failed/ for manual re-add (analogous to the spool).
+
+        When ``worker_id`` is given the update is claim-aware (gated on the row
+        still being that worker's in-flight row), so a late failure from an
+        already-requeued row is a no-op instead of clobbering a fresh claim.
+        Returns ``True`` when the row was updated, ``False`` otherwise.
+        """
+        if worker_id is None:
+            sql = (
+                "UPDATE episode_queue SET status='failed', error=?, worker_id=NULL, "
+                'lease_until=NULL, updated_at=? WHERE id=?'
+            )
+            params = (error, _now_iso(), row_id)
+        else:
+            sql = (
+                "UPDATE episode_queue SET status='failed', error=?, worker_id=NULL, "
+                'lease_until=NULL, updated_at=? '
+                "WHERE id=? AND status='processing' AND worker_id=?"
+            )
+            params = (error, _now_iso(), row_id, worker_id)
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync, self._conn, sql, params
+            )
+            return cur.rowcount > 0
 
     async def requeue_stale(self) -> int:
         """Requeue processing rows whose lease has expired (e.g. after a hard kill).
@@ -558,6 +633,56 @@ class QueueJournal:
                 (_now_iso(), cutoff, worker_id),
             )
             return cur.rowcount
+
+    async def requeue_own_stale(self, row_id: int, worker_id: str, grace_seconds: float) -> bool:
+        """Requeue OUR OWN processing row back to ``pending`` once its lease is stale.
+
+        Watchdog counterpart to ``requeue_stale_except``: the steal guard leaves
+        this process's own rows alone (a long in-flight LLM call on THIS worker
+        must never be double-processed), so the only way a live worker heals its
+        own bad row is to do it itself. The row is moved back only when it is
+        still owned by ``worker_id``, still ``processing``, and its lease expired
+        more than ``grace_seconds`` ago (heartbeat stopped / add_episode hung
+        beyond reason). The claim is re-checked in the same UPDATE (``id`` +
+        ``worker_id`` + ``status``), so a row that was concurrently finished or
+        reclaimed by another worker is never touched.
+
+        ``attempt`` is incremented and ``next_retry_at`` cleared so the requeued
+        row becomes immediately claimable and cannot spin indefinitely.
+
+        Returns ``True`` when the row was requeued, ``False`` when it was not
+        stale / not owned by ``worker_id`` anymore.
+        """
+        cutoff = _later_iso(-grace_seconds)
+        sql = (
+            'UPDATE episode_queue SET status=\'pending\', attempt=attempt+1, '
+            "worker_id=NULL, lease_until=NULL, next_retry_at=NULL, "
+            "error=COALESCE(error, 'requeued own stale lease'), updated_at=? "
+            "WHERE id=? AND worker_id=? AND status='processing' "
+            'AND (lease_until IS NULL OR lease_until <= ?)'
+        )
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync,
+                self._conn,
+                sql,
+                (_now_iso(), row_id, worker_id, cutoff),
+            )
+            return cur.rowcount > 0
+
+    async def row_owned(self, row_id: int, worker_id: str) -> bool:
+        """``True`` when the row is still ``processing`` and owned by ``worker_id``.
+
+        Cheap ownership read used by the per-row watchdog to distinguish "stale
+        but still mine, keep watching" from "no longer mine, stop watching".
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._conn.execute,
+                "SELECT 1 FROM episode_queue WHERE id=? AND worker_id=? AND status='processing'",
+                (row_id, worker_id),
+            )
+            return cur.fetchone() is not None
 
     # ------------------------------------------------------------- counts
 

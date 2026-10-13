@@ -364,6 +364,16 @@ class ResilienceConfig(BaseModel):
         description='How far past an expired lease a processing row must be before '
         'another worker may reclaim it.',
     )
+    journal_processing_timeout_seconds: float = Field(
+        default=1500.0,
+        ge=60.0,
+        description='Absolute wall-clock budget for a single graphiti.add_episode call '
+        'inside the journal worker (per model attempt). A hung LLM call past this '
+        'boundary is aborted and the row is released to retry (exponential backoff), '
+        'so a wedged external call cannot strand a serial group for hours. 1500s '
+        'sits above the worst observed add_episode (~1350s); the per-row watchdog '
+        '(lease_seconds + journal_grace_seconds) still covers the heartbeat path.',
+    )
     model_fallbacks: list[str] = Field(
         default_factory=list,
         description=(
