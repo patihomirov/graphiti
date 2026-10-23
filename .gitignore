@@ -171,3 +171,12 @@ spool/
 # Resilience: durable SQLite write-ahead journal (may contain private episode content)
 journal.db*
 ~/.graphiti/journal.db*
+
+# Local backup / scratch artifacts — never commit
+*.bak
+*.bak-*
+.bak-*
+archive-*
+*.orig
+logs/
+parallel-*.txt
