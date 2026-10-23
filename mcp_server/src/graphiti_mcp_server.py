@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 
 from config.schema import GraphitiConfig, ServerConfig
 from models.response_types import (
+    AddMemoryResponse,
     BuildCommunitiesResponse,
     CommunityResult,
     EpisodeEntitiesResponse,
@@ -249,6 +250,11 @@ class GraphitiService:
         self.semaphore_limit = semaphore_limit
         self.semaphore = asyncio.Semaphore(semaphore_limit)
         self.client: Graphiti | None = None
+        # Feature B: second Graphiti instance routed to the zai overflow provider
+        # (separate quota). Built lazily in initialize() when providers.zai is
+        # configured; None keeps the single-channel behaviour.
+        self.client_zai: Graphiti | None = None
+        self.llm_client_zai: Any | None = None
         self.entity_types: dict[str, type[BaseModel]] | None = None
         self.edge_types: dict[str, type[BaseModel]] | None = None
         self.edge_type_map: dict[tuple[str, str], list[str]] | None = None
@@ -370,6 +376,40 @@ class GraphitiService:
                 # Re-raise other errors
                 raise
 
+            # Feature B: second Graphiti instance on the zai overflow provider.
+            # Same driver / embedder / cross-encoder as the primary, different LLM
+            # client -> a second quota channel an episode can run on entirely.
+            # A broken zai config must never take down the memory service, so a
+            # build failure only disables the channel (health reports it).
+            if (
+                self.config.llm.providers.zai is not None
+                and getattr(self.config.resilience, 'zai_fallback_enabled', False)
+                and self.client is not None
+            ):
+                try:
+                    self.llm_client_zai = LLMClientFactory.create_zai(
+                        self.config.llm,
+                        zai_model=self.config.resilience.zai_model,
+                        max_tokens=max(int(self.config.llm.max_tokens), 8192),
+                    )
+                    zai_client = copy.copy(self.client)
+                    zai_client.llm_client = self.llm_client_zai
+                    zai_client.clients = self.client.clients.model_copy(
+                        update={'llm_client': self.llm_client_zai}
+                    )
+                    self.client_zai = zai_client
+                    logger.info(
+                        'zai overflow channel built (model=%s, url=%s)',
+                        self.config.resilience.zai_model,
+                        self.config.llm.providers.zai.api_url,
+                    )
+                except Exception as e:
+                    self.client_zai = None
+                    self.llm_client_zai = None
+                    logger.warning(
+                        'zai overflow channel disabled: failed to build zai client: %s', e
+                    )
+
             # Build indices
             await self.client.build_indices_and_constraints()
 
@@ -440,6 +480,48 @@ async def _backpressure_error_response(exc: Exception) -> ErrorResponse:
     return ErrorResponse(error=message)
 
 
+# RCA B1 gate: an input that would only fail extraction validation (empty
+# name/title, empty or oversized body, non-string group_id) is rejected HERE,
+# synchronously, instead of being enqueued and then retried to exhaustion as a
+# permanent zombie row (the 375 "Document title Field required" case).
+ADD_MEMORY_BODY_MAX_BYTES = 32 * 1024
+
+
+def _validate_add_memory_input(
+    *, name: Any, episode_body: Any, group_id: Any
+) -> str | None:
+    """Validate add_memory inputs BEFORE enqueueing; None means "valid".
+
+    Returns a human-readable, machine-prefixed rejection reason, or None when the
+    input may proceed. Does not alter the behaviour of valid calls in any way.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return (
+            'graphiti_validation: "name" must be a non-empty string '
+            f'(got {name!r}); refusing to queue a malformed episode'
+        )
+    if not isinstance(episode_body, str):
+        return (
+            'graphiti_validation: "episode_body" must be a string, '
+            f'got {type(episode_body).__name__}'
+        )
+    if not episode_body.strip():
+        return 'graphiti_validation: "episode_body" is empty; nothing to store'
+    body_bytes = len(episode_body.encode('utf-8'))
+    if body_bytes > ADD_MEMORY_BODY_MAX_BYTES:
+        return (
+            f'graphiti_validation: "episode_body" is {body_bytes} bytes, '
+            f'> {ADD_MEMORY_BODY_MAX_BYTES} max. Store the full report in a file '
+            'and pass a pointer (path + anchors + short summary) instead.'
+        )
+    if group_id is not None and not isinstance(group_id, str):
+        return (
+            'graphiti_validation: "group_id" must be a string, '
+            f'got {type(group_id).__name__} ({group_id!r})'
+        )
+    return None
+
+
 @mcp.tool()
 async def add_memory(
     name: str,
@@ -455,7 +537,7 @@ async def add_memory(
     update_communities: bool = False,
     saga: str | None = None,
     saga_previous_episode_uuid: str | None = None,
-) -> SuccessResponse | ErrorResponse:
+) -> AddMemoryResponse | ErrorResponse:
     """Add an episode to memory. This is the primary way to add information to the graph.
 
     This function returns immediately and processes the episode addition in the background.
@@ -526,6 +608,15 @@ async def add_memory(
     if graphiti_service is None or queue_service is None:
         return ErrorResponse(error='Services not initialized')
 
+    # RCA B1: reject malformed input synchronously, BEFORE it reaches the queue,
+    # so a bad episode cannot become a permanent poison zombie row.
+    validation_error = _validate_add_memory_input(
+        name=name, episode_body=episode_body, group_id=group_id
+    )
+    if validation_error is not None:
+        logger.warning('add_memory rejected by validation gate: %s', validation_error)
+        return ErrorResponse(error=validation_error)
+
     # Parse the optional reference_time before queuing so callers get an immediate
     # error on a malformed timestamp rather than a silent background failure.
     try:
@@ -547,8 +638,28 @@ async def add_memory(
                 logger.warning(f"Unknown source type '{source}', using 'text' as default")
                 episode_type = EpisodeType.text
 
-        # Submit to queue service for async processing
-        await queue_service.add_episode(
+        # Opt-in parallelism helper: when auto_previous_episode_uuid is enabled
+        # and the caller gave NO explicit previous episodes (and no saga /
+        # community refresh), pin context to the newest materialized episode of
+        # the group. This makes the episode parallel-safe (requires_serial=0)
+        # while keeping a 1-ancestor context. Default OFF - auto-retrieval of
+        # the recent history is the richer default context.
+        effective_previous = previous_episode_uuids
+        if (
+            getattr(queue_service.resilience, 'auto_previous_episode_uuid', False)
+            and previous_episode_uuids is None
+            and not saga
+            and not update_communities
+        ):
+            last_uuid = await queue_service.last_done_episode_uuid(effective_group_id)
+            if last_uuid:
+                effective_previous = [last_uuid]
+
+        # Submit to queue service for async processing. On the journal-backed
+        # path this returns the durable journal ``row_id`` so the caller can
+        # pass it to a validator as the ``journal_id`` for a fact-check /
+        # verification without waiting for graph materialization.
+        journal_id = await queue_service.add_episode(
             group_id=effective_group_id,
             name=name,
             content=episode_body,
@@ -560,15 +671,21 @@ async def add_memory(
             edge_types=graphiti_service.edge_types,
             edge_type_map=graphiti_service.edge_type_map,
             excluded_entity_types=excluded_entity_types,
-            previous_episode_uuids=previous_episode_uuids,
+            previous_episode_uuids=effective_previous,
             custom_extraction_instructions=custom_extraction_instructions,
             update_communities=update_communities,
             saga=saga,
             saga_previous_episode_uuid=saga_previous_episode_uuid,
         )
 
-        return SuccessResponse(
-            message=f"Episode '{name}' queued for processing in group '{effective_group_id}'"
+        return AddMemoryResponse(
+            message=(
+                f"Episode '{name}' queued for processing in group "
+                f"'{effective_group_id}'"
+            ),
+            status='queued',
+            journal_id=journal_id,
+            materialized=False,
         )
     except (CircuitOpenError, QueueCapacityExceeded, ServerStoppingError) as e:
         # Fail-fast backpressure: the episode was NOT queued and NOT lost. Return a
@@ -983,6 +1100,225 @@ async def search_raw_episodes(
 
 
 @mcp.tool()
+async def mark_verified(
+    journal_id: int,
+    by: str,
+    at: str | None = None,
+) -> dict[str, Any]:
+    """Stamp a raw journal episode as fact-checked in place (in-queue verification).
+
+    Marks a not-yet-materialized episode (found via ``search_raw_episodes`` or
+    returned as ``journal_id`` by ``add_memory``) directly on the durable
+    journal row - so a validator can record "I checked this episode" WITHOUT
+    waiting for extraction/materialization (the graph-level marker only appears
+    once the episode is materialized). Idempotent: re-stamping updates the
+    marker to the latest fact-check. Never touches the row's status/claim/lease,
+    so the worker keeps processing it normally.
+
+    Only available when the resilience journal is enabled.
+
+    Args:
+        journal_id: The journal row id (from ``search_raw_episodes`` or ``add_memory``).
+        by: Verifier identity, e.g. 'validator-hard (GLM)'. At most 128 characters.
+        at: Fact-check timestamp in ISO UTC; defaults to now.
+
+    Returns:
+        ``{ok: true, journal_id, status, materialized}`` on success -
+        ``status`` is the row's current journal status and ``materialized`` is
+        always false (marking does not materialize). On failure a structured
+        ``{ok: false, reason, ...}`` dict.
+    """
+    global queue_service
+
+    if queue_service is None:
+        return {
+            'type': 'mark_verified',
+            'ok': False,
+            'reason': 'Services not initialized',
+        }
+
+    if queue_service.journal is None:
+        return {
+            'type': 'mark_verified',
+            'ok': False,
+            'reason': 'journal disabled',
+            'message': (
+                'In-queue verification unavailable: the durable SQLite journal '
+                'is disabled (set resilience.journal_enabled to enable it)'
+            ),
+        }
+
+    if not by or not by.strip():
+        return {'ok': False, 'reason': 'by is required'}
+    if len(by) > 128:
+        return {'ok': False, 'reason': 'by must be 128 characters or fewer'}
+
+    try:
+        updated = await queue_service.journal.mark_verified(
+            int(journal_id), by=by, at=at
+        )
+        if not updated:
+            return {
+                'ok': False,
+                'reason': 'no such episode',
+                'journal_id': int(journal_id),
+            }
+        row = await queue_service.journal.get_raw(int(journal_id))
+        return {
+            'ok': True,
+            'journal_id': int(journal_id),
+            'status': row['status'] if row is not None else 'unknown',
+            'materialized': False,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error marking episode verified: {error_msg}')
+        return {
+            'type': 'mark_verified',
+            'ok': False,
+            'reason': f'Error marking episode verified: {error_msg}',
+        }
+
+
+@mcp.tool()
+async def mark_questioned(
+    journal_id: int,
+    by: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Stamp a raw journal episode as disputed in place (in-queue questioning).
+
+    The counterpart of ``mark_verified``: flags a not-yet-materialized episode
+    whose fact-check failed (or that needs human attention) directly on the
+    durable journal row - again without waiting for graph materialization. The
+    marker lives in its own ``questioned_by``/``questioned_at`` columns, so it
+    never mixes with ``verified_by`` (previously faked with a 'QUESTIONED: '
+    prefix). Optional ``reason`` is stored in the row's ``error`` diagnostic
+    slot. Never touches status/claim/lease; idempotent.
+
+    Only available when the resilience journal is enabled.
+
+    Args:
+        journal_id: The journal row id (from ``search_raw_episodes`` or ``add_memory``).
+        by: Verifier identity, e.g. 'validator-hard (GLM)'. At most 128 characters.
+        reason: Optional human-readable note on why the episode was questioned.
+
+    Returns:
+        ``{ok: true, journal_id, status, materialized}`` on success - or a
+        structured ``{ok: false, reason, ...}`` dict on failure.
+    """
+    global queue_service
+
+    if queue_service is None:
+        return {
+            'type': 'mark_questioned',
+            'ok': False,
+            'reason': 'Services not initialized',
+        }
+
+    if queue_service.journal is None:
+        return {
+            'type': 'mark_questioned',
+            'ok': False,
+            'reason': 'journal disabled',
+            'message': (
+                'In-queue questioning unavailable: the durable SQLite journal '
+                'is disabled (set resilience.journal_enabled to enable it)'
+            ),
+        }
+
+    if not by or not by.strip():
+        return {'ok': False, 'reason': 'by is required'}
+    if len(by) > 128:
+        return {'ok': False, 'reason': 'by must be 128 characters or fewer'}
+
+    try:
+        updated = await queue_service.journal.mark_questioned(
+            int(journal_id), by=by, reason=reason
+        )
+        if not updated:
+            return {
+                'ok': False,
+                'reason': 'no such episode',
+                'journal_id': int(journal_id),
+            }
+        row = await queue_service.journal.get_raw(int(journal_id))
+        return {
+            'ok': True,
+            'journal_id': int(journal_id),
+            'status': row['status'] if row is not None else 'unknown',
+            'materialized': False,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error marking episode questioned: {error_msg}')
+        return {
+            'type': 'mark_questioned',
+            'ok': False,
+            'reason': f'Error marking episode questioned: {error_msg}',
+        }
+
+
+@mcp.tool()
+async def get_raw_episode(journal_id: int) -> dict[str, Any]:
+    """Return one full raw journal episode (complete body, not a snippet).
+
+    Fetches the entire ``episode_body`` plus all provenance markers
+    (``verified_by``/``verified_at``, ``questioned_by``/``questioned_at``,
+    ``error``) of a journal row - the fact-check source of truth. Unlike
+    ``search_raw_episodes`` (which truncates the body to a 200-char snippet)
+    this lets a validator read the full episode text without bash/SQLite
+    access. ``materialized`` is always false: the journal is not the graph.
+
+    Only available when the resilience journal is enabled.
+
+    Args:
+        journal_id: The journal row id to read.
+
+    Returns:
+        The full row dict on success, or a structured
+        ``{ok: false, reason, ...}`` dict when the row is missing / journal off.
+    """
+    global queue_service
+
+    if queue_service is None:
+        return {
+            'type': 'get_raw_episode',
+            'ok': False,
+            'reason': 'Services not initialized',
+        }
+
+    if queue_service.journal is None:
+        return {
+            'type': 'get_raw_episode',
+            'ok': False,
+            'reason': 'journal disabled',
+            'message': (
+                'Raw episode lookup unavailable: the durable SQLite journal is '
+                'disabled (set resilience.journal_enabled to enable it)'
+            ),
+        }
+
+    try:
+        row = await queue_service.journal.get_raw(int(journal_id))
+        if row is None:
+            return {
+                'ok': False,
+                'reason': 'no such episode',
+                'journal_id': int(journal_id),
+            }
+        return row
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting raw episode: {error_msg}')
+        return {
+            'type': 'get_raw_episode',
+            'ok': False,
+            'reason': f'Error getting raw episode: {error_msg}',
+        }
+
+
+@mcp.tool()
 async def summarize_saga(
     saga_name: str, group_id: str | None = None
 ) -> SagaSummaryResponse | ErrorResponse:
@@ -1302,6 +1638,31 @@ async def health_check(request) -> JSONResponse:
         body['pending_episodes'] = snapshot.get('pending_episodes', 0)
         body['retry_after_seconds'] = snapshot.get('retry_after_seconds', 0)
         body['journal'] = snapshot.get('journal', {'enabled': False})
+        body['storm'] = snapshot.get('storm', {'per_model': {}})
+        # Always-active pacing state (2026-10-21): per-channel limits, current
+        # in-window call counts and inter-episode pause configuration.
+        body['pacing'] = snapshot.get(
+            'pacing',
+            {
+                'enabled': False,
+                'max_calls_per_minute': 0,
+                'window_seconds': 60.0,
+                'inter_episode_interval_seconds': 0.0,
+                'active_channels': 1,
+                'per_channel': {'limit_per_minute': 0},
+            },
+        )
+        # Feature B: zai overflow channel status block.
+        body['zai'] = snapshot.get(
+            'zai',
+            {
+                'enabled': False,
+                'configured': False,
+                'healthy': False,
+                'model': None,
+                'last_error': None,
+            },
+        )
         if snapshot.get('state') in ('open', 'half_open'):
             body['status'] = 'degraded'
 
@@ -1478,7 +1839,10 @@ async def initialize_server() -> ServerConfig:
         episode_builder = _build_episode_builder()
 
     await queue_service.initialize(
-        graphiti_client, episode_builder=episode_builder, llm_semaphore=semaphore
+        graphiti_client,
+        episode_builder=episode_builder,
+        llm_semaphore=semaphore,
+        graphiti_client_zai=graphiti_service.client_zai,
     )
 
     if queue_service.journal is not None:
@@ -1502,6 +1866,7 @@ async def initialize_server() -> ServerConfig:
             interval_seconds=resilience.retryer_interval_seconds,
             max_attempts=resilience.max_spool_attempts,
             backoff_base_seconds=resilience.spool_backoff_base_seconds,
+            backoff_cap_seconds=resilience.retry_backoff_cap_seconds,
         )
         episode_retryer.start()
         logger.info(

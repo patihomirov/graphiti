@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.errors import RateLimitError
 
@@ -208,6 +207,31 @@ class TestIsTransientError:
     )
     def test_transient_table(self, exc, expected):
         assert is_transient_error(exc) is expected
+
+    @pytest.mark.unit
+    def test_openai_api_timeout_is_transient(self):
+        """openai SDK timeout/connection errors ("Request timed out.") are transient."""
+        import httpx
+        from openai import APIConnectionError, APITimeoutError
+
+        timeout = APITimeoutError(request=httpx.Request('POST', 'http://x/v1'))
+        connection = APIConnectionError(
+            message='Connection error.', request=httpx.Request('POST', 'http://x/v1')
+        )
+        assert is_transient_error(timeout) is True
+        assert is_transient_error(connection) is True
+
+    @pytest.mark.unit
+    def test_openai_non_timeout_errors_stay_non_transient(self):
+        """A hard openai 4xx stays permanent; the fix must not widen blindly."""
+        import httpx
+        from openai import AuthenticationError
+
+        req = httpx.Request('POST', 'http://x/v1')
+        auth = AuthenticationError(
+            'auth', response=httpx.Response(401, request=req), body=None
+        )
+        assert is_transient_error(auth) is False
 
 
 class TestBackpressure:

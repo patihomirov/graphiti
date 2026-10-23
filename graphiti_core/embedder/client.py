@@ -17,6 +17,7 @@ limitations under the License.
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -36,3 +37,40 @@ class EmbedderClient(ABC):
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         raise NotImplementedError()
+
+    def set_channel_rate_limiter(self, limiter: Any) -> None:
+        """Attach (or clear, with None) the per-channel rate limiter (duck-typed).
+
+        Mirrors ``LLMClient.set_channel_rate_limiter``: every embedding call goes
+        through ``limiter.acquire(channel_key())`` before hitting the wire when the
+        limiter is enabled. Embeddings are the largest request source at the
+        gateway, so they get their own sliding-window ceiling instead of burning
+        the shared chat bucket.
+        """
+        self.channel_rate_limiter = limiter
+
+    def channel_key(self) -> str:
+        """The (base_url, embedding_model) channel key used by the rate limiter.
+
+        ``getattr`` keeps it safe for embedders whose config lacks one of the
+        fields (e.g. Voyage/Gemini/Azure); a missing piece degrades to
+        ``'unknown'`` rather than raising.
+        """
+        config = getattr(self, 'config', None)
+        base = getattr(config, 'base_url', None) or 'unknown'
+        model = getattr(config, 'embedding_model', None) or 'unknown'
+        return f'{base}|{model}'
+
+    async def _channel_pace(self) -> None:
+        """Wait for a free slot on this channel's rate limiter, if one is set.
+
+        No-op when no limiter is attached or its limit is 0 (OFF). The wait is
+        async on the caller's coroutine, so a saturated channel parks only the
+        current embedding call, never the whole pool.
+        """
+        limiter = getattr(self, 'channel_rate_limiter', None)
+        if limiter is None:
+            return
+        if not getattr(limiter, 'enabled', False):
+            return
+        await limiter.acquire(self.channel_key())

@@ -1,0 +1,154 @@
+# Graphiti MCP Server Configuration for O3 LLM Gateway
+# LLM: O3 Gateway (OpenAI-compatible) — Qwen/Qwen3-14B-AWQ
+# Embedder: O3 Gateway — Qwen/Qwen3-Embedding-8B
+# Database: Neo4j (local)
+# Port: 8003
+
+server:
+  transport: "stdio"
+
+llm:
+  provider: "openai"
+  # 2026-10-22 ozon-solo drain step2 (ОТКАТ экстракции на big): активная была переведена на
+  # AgentLLM-default, но на РЕАЛЬНЫХ эпизодах (>3KB) default даёт empty response (0 completions
+  # за 9 мин; 4+ empty/5мин) — критерий отката §3 graphiti-resilience. big валидирован на
+  # реальном теле (20.10: 80 сущ./90 связей, empty=0, 4.8с); его 429 были пакетными (3 воркера +
+  # failover), одиночный темп (journal_workers=1) их убирает — как и на default.
+  model: "AgentLLM-big"
+  max_tokens: 32768
+
+  providers:
+    openai:
+      api_key: {file:${HOME}/.o3_llm_token}   # REPLACE with your key or {file:...} path
+      api_url: "https://llm-gateway-proton.t.o3.ru/v1"
+
+    # Feature B: zai overflow channel (Z.AI via local o3-plugin-agent proxy).
+    # The vendor token is referenced by file path ({file:...}), never embedded.
+    # This block only takes effect when resilience.zai_fallback_enabled is true.
+    zai:
+      api_url: "http://127.0.0.4:3128/zai/openai/v1"
+      api_key: "{file:{env:HOME}/.o3-cli/zai_vendor_token}"
+
+embedder:
+  provider: "openai"
+  model: "Qwen/Qwen3-Embedding-8B"
+  dimensions: 1024
+
+  providers:
+    openai:
+      api_key: "${OPENAI_API_KEY}"
+      api_url: "https://llm-gateway-proton.t.o3.ru/v1"
+
+database:
+  provider: "neo4j"
+
+  providers:
+    neo4j:
+      uri: "bolt://localhost:7687"
+      username: "neo4j"
+      password: "password"
+      database: "neo4j"
+
+graphiti:
+  group_id: "main"
+  user_id: "mcp_user"
+  entity_types:
+    - name: "Preference"
+      description: "User preferences, choices, opinions, or selections (PRIORITIZE over most other types except User/Assistant)"
+    - name: "Requirement"
+      description: "Specific needs, features, or functionality that must be fulfilled"
+    - name: "Procedure"
+      description: "Standard operating procedures and sequential instructions"
+    - name: "Location"
+      description: "Physical or virtual places where activities occur"
+    - name: "Event"
+      description: "Time-bound activities, occurrences, or experiences"
+    - name: "Organization"
+      description: "Companies, institutions, groups, or formal entities"
+    - name: "Document"
+      description: "Information content in various forms (books, articles, reports, etc.)"
+    - name: "Topic"
+      description: "Subject of conversation, interest, or knowledge domain (use as last resort)"
+    - name: "Person"
+      description: "An individual human referenced in the content"
+    - name: "Object"
+      description: "Physical items, tools, devices, or possessions (use as last resort)"
+
+resilience:
+  journal_enabled: true
+  journal_path: "~/.graphiti/journal.db"
+  # 2026-10-22 ozon-solo drain: workers 3 -> 1 — один последовательный вызов за раз
+  # (шлюз душит пакеты 429; одиночные вызовы идут 200). followers лимит 0 оставлен.
+  # 2026-10-22 drain-speedup attempt2 (workers3b) → ОТКАТ на 2 (19:40 UTC, ~1ч прогона):
+  # 3 воркера НЕ ускорили дренаж: done +1 за час (285), pending вырос 292→296,
+  # processed_1h 1 (при 2 воркерах было 2-4), 429 вернулся (~2/мин, был 0), Completed=1 за час.
+  # Механизм: общий always-on rate-limiter (30 вызовов/мин, кап 480с) связывает пропускную
+  # способность — лишний воркер добавляет только конкурентность/пакеты → 429. Откат легитимен.
+  journal_workers: 2
+  journal_follower_limit: 0
+  retryer_interval_seconds: 300.0
+  semaphore_limit: 10
+  auto_previous_episode_uuid: true
+  journal_max_pending: 300
+  journal_steward_interval_seconds: 15.0
+  journal_grace_seconds: 60.0
+  journal_lease_seconds: 300.0
+  journal_processing_timeout_seconds: 1500.0
+  # 2026-10-22 ozon-solo drain step2: активная вернулась на big, поэтому fallback -> AgentLLM-default
+  # (исходный базлайн вызывающего; default страхует big при жёстком сбое, эпизод при empty не теряется).
+  model_fallbacks:
+    - "AgentLLM-default"
+  enqueue_breakthrough_max_pending: 5
+  # Feature B: enable the zai overflow channel (rollout-flag; changes prod
+  # failover behaviour). zai_loss_strikes = consecutive proxy losses before the
+  # channel auto-rolls back to ozon.
+  # 2026-10-22 zai-дренаж включён lead 22.10, баланс пополнен: zai активен как
+  # второй контур разгрузки при overflow-бэклоге (прямой вызов 200, ошибки 1113 нет).
+  zai_fallback_enabled: true
+  # Overflow backlog gate (2026-10-16): the zai channel participates in failover
+  # candidates only while unfinished (pending+processing) >= this threshold.
+  # 2026-10-22 zai-drain lead 22.10: 120 (не 0) — zai участвует при unfinished >= 120;
+  # при прореживании <120 zai отключается, не сжигая квоту Z.AI.
+  zai_overflow_pending_threshold: 120
+  # Cheaper overflow model (P0-proven glm-5.3-flash; glm-5-turbo maps to the
+  # same wire id). Doubles as the (provider, model) channel key.
+  zai_model: "zai/glm-5.3-flash"
+  # --- Always-active pacing (2026-10-21) ---
+  # Лимитируем скорость обработки очереди со СВОЕЙ стороны, чтобы не дёргать
+  # llm-gateway-proton пакетами и не получать 429 (шлюз режет пакеты любых
+  # моделей, Retry-After не отдаёт). Не реактивный шторм-троттлинг, а честный
+  # всегда-активный rate-limiter на (provider, model) канал.
+  # Per-channel ceiling: максимум LLM-вызовов (chat completions) на канал в
+  # скользящем 60s-окне. 0 = OFF (legacy). 60 RPM ~ 1 вызов/сек в среднем;
+  # при ~20 вызовов/эпизод даёт ~3 эп/мин суммарно (цель processed_1h 60-120).
+  # autofix-20261022: lower pacing 60->30, storm 5->8 to reduce 429 pressure on storming llm-gateway-proton pool (graphiti-autowatch)
+  channel_max_calls_per_minute: 30
+  # 2026-10-22 frequency-opt: отдельный лимитер на embedder-канал
+  # (base_url|Qwen/Qwen3-Embedding-8B). Эмбеддинги = главный источник запросов на
+  # шлюзе (61% замера, 717 embeddings vs 458 chat/час; пики до 187/мин) и жгут тот
+  # же bucket, что и chat. Отдельный sliding-window потолок сглаживает пики до
+  # этого значения (не гейтит здоровый ход: норм. ~2 эмбеддинга/мин). 0 = OFF.
+  channel_max_embeddings_per_minute: 60
+  # Межэпизодная пауза воркера: после завершения эпизода воркер ждёт
+  # interval * число активных каналов (интервал глобальный, не только in_storm),
+  # чтобы пул не стартовал новый эпизод мгновенно (это и создаёт пакеты).
+  # 5.0 * 2 канала (AgentLLM-big + AgentLLM-default) = 10s между эпизодами.
+  storm_min_request_interval_seconds: 8.0
+  # Если лимитер оценивает ожидание слота дольше этого - воркер переходит к
+  # следующему каналу failover вместо ожидания за насыщенным каналом.
+  channel_wait_abort_seconds: 60.0
+  # 2026-10-22 backoff-cap: потолок экспоненциального ретрай-бэкоффа журнальных
+  # эпизодов (и spool-retryer due-window). Без капа 30s база растёт до ~1920s
+  # (32 мин) на attempt 7 — эпизоды «засыпают», done замирает. Кап возвращает
+  # эпизод в работу за минуты; StormThrottle + per-channel rate limiter и так
+  # гейтят частоту. Применяется ПОСЛЕ шторм-множителя (даже storming-канал не
+  # спит дольше капа). Дренаж-решение lead 22.10 («дренируем через zai»).
+  retry_backoff_cap_seconds: 480.0
+  # 2026-10-22 zai-first balance: активный ozon-канал формально «здоров» (репутация
+  # считает только 429), но фактически таймаутит (Request timed out / stream timeout /
+  # Connection error) — zai не поднимается. Когда таких событий на активном канале
+  # >= zai_first_timeout_threshold за окно zai_first_timeout_window_seconds, zai
+  # ставится ПЕРВЫМ кандидатом failover (дренаж через zai). В здоровом окне — обычный
+  # порядок (active первый). Порог 2 = одиночный таймаут это шум, поток — деградация.
+  zai_first_timeout_window_seconds: 300.0
+  zai_first_timeout_threshold: 2

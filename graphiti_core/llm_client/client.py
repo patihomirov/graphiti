@@ -18,12 +18,13 @@ import contextvars
 import hashlib
 import json
 import logging
+import random
 import typing
 from abc import ABC, abstractmethod
 
 import httpx
 from pydantic import BaseModel
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt
 
 from ..prompts.models import Message
 from ..tracer import NoOpTracer, Tracer
@@ -73,6 +74,60 @@ def is_server_or_retry_error(exception):
     )
 
 
+def _retry_after_hint(exception: BaseException | None) -> float | None:
+    """Best-effort Retry-After delay from an exception, walking the cause chain.
+
+    Returns the first positive hint found: a ``retry_after`` attribute on a
+    wrapped RateLimitError (the graphiti-core path) or a ``Retry-After`` header
+    on any httpx.HTTPStatusError deeper in ``__cause__``. Never raises.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exception
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        attr = getattr(current, 'retry_after', None)
+        if isinstance(attr, (int, float)) and attr > 0:
+            return float(attr)
+        if isinstance(current, httpx.HTTPStatusError):
+            headers = getattr(current.response, 'headers', None)
+            if headers is not None:
+                value = headers.get('retry-after')
+                if value:
+                    try:
+                        delay = float(value)
+                        if delay > 0:
+                            return delay
+                    except (TypeError, ValueError):
+                        pass
+        current = current.__cause__
+    return None
+
+
+def _wait_for_retry(retry_state) -> float:
+    """Backoff for LLM retries: honour Retry-After (capped), else exponential.
+
+    A provider Retry-After is a direct request to stop calling; hammering past
+    it is exactly what turns a burst into a storm. When the failing exception
+    carries a hint it wins (capped at 60s so a silly header cannot stall the
+    queue); otherwise fall back to an exponential backoff with jitter:
+    min(60, 2^attempt * uniform(0.5, 1.5)).
+    """
+    outcome = getattr(retry_state, 'outcome', None)
+    exc = outcome.exception() if outcome is not None else None
+    hint = _retry_after_hint(exc) if exc is not None else None
+    if hint is not None:
+        delay = min(60.0, max(0.1, hint))
+    else:
+        attempt = max(1, int(retry_state.attempt_number))
+        delay = min(60.0, (2 ** attempt) * random.uniform(0.5, 1.5))
+    logger.warning(
+        '_wait_for_retry (retry_after=%s): sleeping %.1fs before next attempt',
+        hint,
+        delay,
+    )
+    return delay
+
+
 class LLMClient(ABC):
     def __init__(self, config: LLMConfig | None, cache: bool = False):
         if config is None:
@@ -97,6 +152,16 @@ class LLMClient(ABC):
             contextvars.ContextVar(f'llm_model_override_{id(self)}', default=None)
         )
 
+        # Always-active per-channel rate limiter (mcp_server, 2026-10-21). When
+        # set, EVERY chat-completions call goes through
+        # ``limiter.acquire(channel_key())`` BEFORE hitting the wire, so the
+        # (provider, model) channel stream stays below the configured
+        # calls-per-minute ceiling and never bursts packets at the gateway.
+        # The limiter is duck-typed (``enabled`` + ``acquire`` may come from any
+        # object); None keeps the legacy behaviour (no client-side pacing - the
+        # reactive StormThrottle in the journal worker still applies).
+        self.channel_rate_limiter: typing.Any = None
+
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
             self.cache_dir = LLMCache(DEFAULT_CACHE_DIR)
@@ -120,6 +185,49 @@ class LLMClient(ABC):
         automatically discarded when the task ends.
         """
         self._model_override.set(model)
+
+    def set_channel_rate_limiter(self, limiter: typing.Any) -> None:
+        """Attach (or clear, with None) the per-channel rate limiter (duck-typed).
+
+        Every subsequent ``_generate_response`` goes through
+        ``limiter.acquire(channel_key())`` when ``limiter.enabled`` is True.
+        The same limiter instance is shared by the ozon client, the zai
+        overflow client and the journal-worker failover gate, so the
+        per-(provider, model) ceiling is enforced across all of them.
+        """
+        self.channel_rate_limiter = limiter
+
+    def channel_key(self) -> str:
+        """The (provider, model) channel key used by the rate limiter.
+
+        ``provider`` is the configured base_url (same provider = same quota),
+        ``model`` is the model that will actually be sent on the wire - the
+        per-task override when pinned, else the configured model. This matches
+        the journal worker's failover-gate key (see queue_service
+        ``_channel_for_candidate``) so a saturated channel is detected before
+        an episode starts on it.
+        """
+        base = (
+            getattr(self.config, 'base_url', None)
+            or self._get_provider_type()
+            or 'unknown'
+        )
+        model = self.model_override or self.model or ''
+        return f'{base}|{model}'
+
+    async def _channel_pace(self) -> None:
+        """Wait for a free slot on this channel's rate limiter, if one is set.
+
+        No-op when no limiter is attached or its limit is 0 (OFF). The wait is
+        async on the caller's coroutine: a saturated channel parks only the
+        current call, never the whole pool.
+        """
+        limiter = self.channel_rate_limiter
+        if limiter is None:
+            return
+        if not getattr(limiter, 'enabled', False):
+            return
+        await limiter.acquire(self.channel_key())
 
     def set_tracer(self, tracer: Tracer) -> None:
         """Set the tracer for this LLM client."""
@@ -149,7 +257,7 @@ class LLMClient(ABC):
 
     @retry(
         stop=stop_after_attempt(4),
-        wait=wait_random_exponential(multiplier=10, min=5, max=120),
+        wait=_wait_for_retry,
         retry=retry_if_exception(is_server_or_retry_error),
         after=lambda retry_state: logger.warning(
             f'Retrying {retry_state.fn.__name__ if retry_state.fn else "function"} after {retry_state.attempt_number} attempts...'
@@ -166,6 +274,11 @@ class LLMClient(ABC):
         model_size: ModelSize = ModelSize.medium,
     ) -> dict[str, typing.Any]:
         try:
+            # Always-active per-channel pacing: wait for a free slot on this
+            # (provider, model) channel before EVERY wire call (each tenacity
+            # retry re-passes through it, keeping the stream to the configured
+            # ceiling even under a failure storm).
+            await self._channel_pace()
             return await self._generate_response(messages, response_model, max_tokens, model_size)
         except (httpx.HTTPStatusError, RateLimitError) as e:
             raise e

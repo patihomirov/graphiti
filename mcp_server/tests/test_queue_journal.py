@@ -426,6 +426,33 @@ class TestQueueServiceJournal:
         finally:
             await service.close()
 
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_add_episode_returns_journal_row_id(self, tmp_path):
+        """add_episode surfaces the durable journal row id (feeds add_memory's
+        journal_id), and a dedup'd duplicate returns the SAME row id."""
+        client = AsyncMock(spec=Graphiti)
+        service = QueueService(make_config(tmp_path / 'rowid.db'))
+        await service.initialize(client, episode_builder=make_builder())
+        try:
+            row_id = await service.add_episode(
+                group_id='g1', name='ep', content='body',
+                source_description='d', episode_type='text',
+                entity_types=None, uuid='u-rowid',
+            )
+            assert isinstance(row_id, int) and row_id > 0
+            row = fetch_row(str(tmp_path / 'rowid.db'), row_id)
+            assert row is not None and row['name'] == 'ep'
+            # Same uuid -> INSERT OR IGNORE dedup returns the same row id.
+            again = await service.add_episode(
+                group_id='g1', name='ep', content='body',
+                source_description='d', episode_type='text',
+                entity_types=None, uuid='u-rowid',
+            )
+            assert again == row_id
+        finally:
+            await service.close()
+
 
 def make_builder():
     """Episode builder used by journal tests: forwards a subset of kwargs."""
@@ -1153,3 +1180,226 @@ class TestMarkVerified:
             assert claimed['verified_by'] == 'validator'
         finally:
             await j.close()
+
+
+class TestMarkQuestioned:
+    """In-queue 'disputed' marker: a validator stamps questioned_by/questioned_at
+    directly on a raw journal row, independent of verified_* columns."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_questioned_sets_by_and_at(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mq-1', name='question me', episode_body='raw body')
+        )
+        assert (
+            await journal.mark_questioned(
+                row_id, by='validator-hard', reason='hallucinated', at='2026-10-09T10:00:00+00:00'
+            )
+            is True
+        )
+        hits = await journal.search_raw('question me')
+        assert len(hits) == 1
+        entry = hits[0]
+        assert entry['questioned_by'] == 'validator-hard'
+        assert entry['questioned_at'] == '2026-10-09T10:00:00+00:00'
+        # Questioning does not touch the status.
+        assert entry['status'] == 'pending'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_questioned_second_call_updates_to_latest(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mq-2', name='re-question', episode_body='b')
+        )
+        first = '2026-10-09T10:00:00+00:00'
+        second = '2026-10-09T11:30:00+00:00'
+        assert await journal.mark_questioned(row_id, by='validator', at=first) is True
+        assert await journal.mark_questioned(row_id, by='validator-hard', at=second) is True
+        hits = await journal.search_raw('re-question')
+        assert hits[0]['questioned_by'] == 'validator-hard'
+        assert hits[0]['questioned_at'] == second
+        assert hits[0]['status'] == 'pending'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_questioned_unknown_row_returns_false(self, journal):
+        assert await journal.mark_questioned(999_999, by='validator') is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_questioned_does_not_change_status(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mq-st', name='status stable q', episode_body='b')
+        )
+        await journal.mark_questioned(
+            row_id, by='validator', at='2026-10-09T10:00:00+00:00'
+        )
+        # Still pending, still claimable by a worker.
+        assert await journal.count_pending() == 1
+        claimed = await journal.claim_next('g1', 'w')
+        assert claimed is not None and claimed['id'] == row_id
+        # The questioned marker survives the claim (provenance kept).
+        assert claimed['questioned_by'] == 'validator'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_mark_questioned_reason_stored_in_error(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mq-err', name='reasoned', episode_body='b')
+        )
+        # With a reason it lands in the diagnostic error slot...
+        await journal.mark_questioned(
+            row_id, by='validator', reason='contradicts source X'
+        )
+        row = await journal.get_raw(row_id)
+        assert row is not None and row['error'] == 'contradicts source X'
+        assert row['questioned_by'] == 'validator'
+        # ...and a follow-up mark without reason must NOT clobber it.
+        await journal.mark_questioned(row_id, by='validator-hard')
+        row = await journal.get_raw(row_id)
+        assert row['error'] == 'contradicts source X'
+        assert row['questioned_by'] == 'validator-hard'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_verified_and_questioned_are_independent(self, journal):
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='mq-ind', name='both markers', episode_body='b')
+        )
+        await journal.mark_verified(row_id, by='validator-a')
+        await journal.mark_questioned(row_id, by='validator-b', reason='recheck')
+        row = await journal.get_raw(row_id)
+        assert row['verified_by'] == 'validator-a'
+        assert row['questioned_by'] == 'validator-b'
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_migration_adds_questioned_columns_idempotently(self, tmp_path):
+        # A pre-questioned journal has no questioned_* columns; opening it with
+        # the current QueueJournal must add them idempotently, and opening it a
+        # second time is a no-op.
+        db = tmp_path / 'legacy-questioned.db'
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            'CREATE TABLE episode_queue ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, dedup_key TEXT NOT NULL, uuid TEXT, '
+            'group_id TEXT NOT NULL, name TEXT NOT NULL, episode_body TEXT NOT NULL, '
+            "plan_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK (status IN ('pending', 'processing', 'done', 'failed')), "
+            'attempt INTEGER NOT NULL DEFAULT 0, worker_id TEXT, lease_until TEXT, '
+            'first_failure_ts TEXT, last_attempt_ts TEXT, next_retry_at TEXT, '
+            'error TEXT, verified_by TEXT, verified_at TEXT, '
+            'requires_serial INTEGER NOT NULL DEFAULT 0, '
+            'created_at TEXT NOT NULL, updated_at TEXT NOT NULL)'
+        )
+        conn.commit()
+        conn.close()
+
+        j = QueueJournal(db, lease_seconds=300.0)
+        try:
+            cols = {
+                r[1]
+                for r in sqlite3.connect(db).execute('PRAGMA table_info(episode_queue)')
+            }
+            assert 'questioned_by' in cols
+            assert 'questioned_at' in cols
+            # Fresh writes + questioning + full-body read work on the migrated schema.
+            row_id, inserted = await j.enqueue(
+                make_plan(uuid='mq-mig', name='migrated q row', episode_body='body')
+            )
+            assert inserted is True and row_id > 0
+            assert (
+                await j.mark_questioned(
+                    row_id, by='validator', at='2026-10-09T10:00:00+00:00'
+                )
+                is True
+            )
+            row = await j.get_raw(row_id)
+            assert row is not None and row['questioned_by'] == 'validator'
+            hits = await j.search_raw('migrated q row')
+            assert hits[0]['questioned_by'] == 'validator'
+        finally:
+            await j.close()
+
+        # Idempotent: a second open of the already-migrated DB must not error.
+        j2 = QueueJournal(db, lease_seconds=300.0)
+        await j2.close()
+
+
+class TestGetRaw:
+    """Full-body journal reads for in-queue fact-checks (no bash/SQLite needed)."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_get_raw_returns_full_body_and_markers(self, journal):
+        long_body = 'x' * 500
+        row_id, _ = await journal.enqueue(
+            make_plan(uuid='gr-1', name='full body', episode_body=long_body)
+        )
+        await journal.mark_verified(row_id, by='validator-a')
+        await journal.mark_questioned(row_id, by='validator-b')
+        row = await journal.get_raw(row_id)
+        assert row is not None
+        assert row['id'] == row_id
+        assert row['episode_body'] == long_body  # NOT truncated to 200 chars
+        assert len(row['episode_body']) == 500
+        assert row['name'] == 'full body'
+        assert row['status'] == 'pending'
+        assert row['group_id'] == 'g1'
+        assert row['verified_by'] == 'validator-a'
+        assert row['questioned_by'] == 'validator-b'
+        assert 'materialized' in row and row['materialized'] is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_get_raw_unknown_row_returns_none(self, journal):
+        assert await journal.get_raw(999_999) is None
+
+
+class TestSerialSafeDigest:
+    """Phase 5: follower eligibility + newest-done predecessor helpers."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_has_due_serial_safe(self, journal):
+        # Serial-only group -> followers have nothing.
+        await journal.enqueue(make_plan(uuid='d-s'))
+        assert await journal.has_due_serial_safe('g1') is False
+        # Parallel-safe row appears -> followers eligible.
+        await journal.enqueue(
+            make_plan(uuid='d-p', previous_episode_uuids=['u-written'])
+        )
+        assert await journal.has_due_serial_safe('g1') is True
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_has_due_serial_safe_excludes_backed_off(self, journal):
+        from datetime import datetime, timedelta, timezone
+
+        await journal.enqueue(
+            make_plan(uuid='d-bo', previous_episode_uuids=['u-written'])
+        )
+        row = await journal.claim_next('g1', 'w', leader=False)
+        await journal.bump_retry(
+            row['id'],
+            attempt=1,
+            error='x',
+            next_retry_at=(datetime.now(timezone.utc) + timedelta(seconds=600)).isoformat(),
+        )
+        # Backed off -> not due for a follower right now.
+        assert await journal.has_due_serial_safe('g1') is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_last_done_uuid_is_newest_materialized(self, journal):
+        await journal.enqueue(make_plan(uuid='done-1'))
+        first = await journal.claim_next('g1', 'w', leader=True)
+        await journal.mark_done(first['id'])
+        assert await journal.last_done_uuid('g1') == 'done-1'
+        # A newer done row wins (strict FIFO claim by id keeps the order).
+        await journal.enqueue(make_plan(uuid='done-2'))
+        second = await journal.claim_next('g1', 'w', leader=True)
+        await journal.mark_done(second['id'])
+        assert await journal.last_done_uuid('g1') == 'done-2'
+        assert await journal.last_done_uuid('other-group') is None

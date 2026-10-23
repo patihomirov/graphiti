@@ -49,17 +49,25 @@ class OpenAIEmbedder(EmbedderClient):
         if client is not None:
             self.client = client
         else:
-            self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+            # max_retries=0: the SDK's built-in retry (default 2, with its own
+            # hidden backoff) silently multiplies the embedding request rate on a
+            # 429 / 5xx storm and burns the gateway quota. Retries are owned by
+            # the caller's tenacity layer (same reasoning as the chat client).
+            self.client = AsyncOpenAI(
+                api_key=config.api_key, base_url=config.base_url, max_retries=0
+            )
 
     async def create(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
+        await self._channel_pace()
         result = await self.client.embeddings.create(
             input=input_data, model=self.config.embedding_model
         )
         return result.data[0].embedding[: self.config.embedding_dim]
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        await self._channel_pace()
         result = await self.client.embeddings.create(
             input=input_data_list, model=self.config.embedding_model
         )

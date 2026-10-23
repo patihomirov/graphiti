@@ -64,6 +64,10 @@ _ROW_COLUMNS = (
     'attempted_models',
     'verified_by',
     'verified_at',
+    'questioned_by',
+    'questioned_at',
+    'repeat_signature',
+    'repeat_count',
     'created_at',
     'updated_at',
 )
@@ -88,6 +92,8 @@ CREATE TABLE IF NOT EXISTS episode_queue (
     error          TEXT,
     verified_by    TEXT,
     verified_at    TEXT,
+    questioned_by  TEXT,
+    questioned_at  TEXT,
     requires_serial INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
@@ -220,6 +226,35 @@ class QueueJournal:
             # Fact-check timestamp (ISO UTC) paired with ``verified_by``.
             self._conn.execute(
                 'ALTER TABLE episode_queue ADD COLUMN verified_at TEXT'
+            )
+        if 'questioned_by' not in existing:
+            # In-queue "disputed" marker (who questioned this raw episode).
+            # Paired with ``questioned_at``; independent of the verified_*
+            # columns so a row can be both verified and later questioned.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN questioned_by TEXT'
+            )
+        if 'questioned_at' not in existing:
+            # Questioned timestamp (ISO UTC) paired with ``questioned_by``.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN questioned_at TEXT'
+            )
+        if 'repeat_signature' not in existing:
+            # Poison-detection signature (RCA C2): the normalized first 120 chars
+            # of the last failure's error text. Rows created before the column
+            # existed simply have no signature -> the poison counter is seeded on
+            # the first failure after the migration.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN repeat_signature TEXT'
+            )
+        if 'repeat_count' not in existing:
+            # Poison-detection counter (RCA C2): how many consecutive failures
+            # carried ``repeat_signature``. Reset to 1 whenever the signature
+            # changes; when it reaches the poison threshold the row is quarantined
+            # (mark_failed) instead of retrying to max_spool_attempts.
+            self._conn.execute(
+                'ALTER TABLE episode_queue ADD COLUMN '
+                'repeat_count INTEGER NOT NULL DEFAULT 0'
             )
         # Created here (after any ALTER) so it is valid on both fresh and
         # migrated journals; an early CREATE with the missing column would fail.
@@ -441,12 +476,22 @@ class QueueJournal:
         error: str,
         next_retry_at: str,
         worker_id: str | None = None,
+        repeat_signature: str | None = None,
+        repeat_count: int | None = None,
     ) -> bool:
         """Keep a failed row pending for a later retry (exponential backoff).
 
-        ``attempted_models`` is reset to NULL here: a backoff interval is the
-        release point for the 429 storm, so the next claim restarts from the
-        active model instead of replaying the previously failed chain.
+        ``attempted_models`` is deliberately left untouched (RCA C6): the next
+        claim must NOT restart from the degraded active model, but continue from
+        the next not-yet-attempted channel. ``_failover_candidates`` skips
+        already-attempted models and, when every model was tried, falls back to a
+        single ``None`` candidate (the standard non-override path), so an
+        exhausted chain can never deadlock.
+
+        When provided, ``repeat_signature``/``repeat_count`` feed the
+        poison-detection state (RCA C2) via ``COALESCE`` - a ``None`` leaves the
+        stored value untouched, so callers that do not participate in the poison
+        bookkeeping (retryer, tests, migration rows) never clobber it.
 
         When ``worker_id`` is given the retry is claim-aware: the update is gated
         on the row still being owned by that worker, so a late failure from an
@@ -456,7 +501,9 @@ class QueueJournal:
         if worker_id is None:
             sql = (
                 "UPDATE episode_queue SET status='pending', attempt=?, error=?, "
-                "next_retry_at=?, worker_id=NULL, lease_until=NULL, attempted_models=NULL, "
+                "next_retry_at=?, worker_id=NULL, lease_until=NULL, "
+                "repeat_signature=COALESCE(?, repeat_signature), "
+                "repeat_count=COALESCE(?, repeat_count), "
                 "first_failure_ts=COALESCE(first_failure_ts, ?), last_attempt_ts=?, updated_at=? "
                 'WHERE id=?'
             )
@@ -464,6 +511,8 @@ class QueueJournal:
                 attempt,
                 error,
                 next_retry_at,
+                repeat_signature,
+                repeat_count,
                 _now_iso(),
                 _now_iso(),
                 _now_iso(),
@@ -472,7 +521,9 @@ class QueueJournal:
         else:
             sql = (
                 "UPDATE episode_queue SET status='pending', attempt=?, error=?, "
-                "next_retry_at=?, worker_id=NULL, lease_until=NULL, attempted_models=NULL, "
+                "next_retry_at=?, worker_id=NULL, lease_until=NULL, "
+                "repeat_signature=COALESCE(?, repeat_signature), "
+                "repeat_count=COALESCE(?, repeat_count), "
                 "first_failure_ts=COALESCE(first_failure_ts, ?), last_attempt_ts=?, updated_at=? "
                 "WHERE id=? AND status='processing' AND worker_id=?"
             )
@@ -480,6 +531,8 @@ class QueueJournal:
                 attempt,
                 error,
                 next_retry_at,
+                repeat_signature,
+                repeat_count,
                 _now_iso(),
                 _now_iso(),
                 _now_iso(),
@@ -545,6 +598,92 @@ class QueueJournal:
             )
             return cur.rowcount > 0
 
+    async def mark_questioned(
+        self,
+        row_id: int,
+        *,
+        by: str,
+        reason: str | None = None,
+        at: str | None = None,
+    ) -> bool:
+        """Stamp a durable journal row as disputed in place (in-queue questioning).
+
+        The counterpart of ``mark_verified``: a validator flags a raw episode
+        whose fact-check failed (or that needs human attention) by writing a
+        ``questioned_by``/``questioned_at`` marker directly on the journal row,
+        again without waiting for graph materialization. Unlike the old
+        ``'QUESTIONED: …'`` prefix hack in ``verified_by``, the questioned marker
+        lives in its own columns, so verified and questioned state never mix and
+        ``verified_by``-based queries stay clean.
+
+        Idempotent: re-calling updates the marker to the latest fact-check.
+
+        Args:
+            row_id: The journal row to mark.
+            by: Verifier identity (e.g. 'validator-hard').
+            reason: Optional human-readable why-it-is-questioned note. Stored in
+                the row's ``error`` column (the natural diagnostic slot) when
+                provided; it never touches status/claim/lease/replay semantics.
+            at: Fact-check timestamp in ISO UTC; defaults to now.
+
+        Returns:
+            True when the row was updated, False when ``row_id`` does not exist.
+        """
+        if reason is not None:
+            sql = (
+                'UPDATE episode_queue SET questioned_by=?, questioned_at=?, '
+                'error=?, updated_at=? WHERE id=?'
+            )
+            params = (by, at or _now_iso(), reason, _now_iso(), row_id)
+        else:
+            sql = (
+                'UPDATE episode_queue SET questioned_by=?, questioned_at=?, '
+                'updated_at=? WHERE id=?'
+            )
+            params = (by, at or _now_iso(), _now_iso(), row_id)
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync, self._conn, sql, params
+            )
+            return cur.rowcount > 0
+
+    async def get_raw(self, row_id: int) -> dict[str, Any] | None:
+        """Return one full raw journal row, or None when it does not exist.
+
+        Unlike ``search_raw`` (which ships a truncated ``snippet``), this
+        returns the complete ``episode_body`` plus all provenance markers --
+        the fact-check source-of-truth a validator reads before stamping a row.
+        ``materialized`` is always False here: the journal is not the graph,
+        materialization is a separate step.
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._conn.execute,
+                'SELECT id, status, group_id, name, episode_body, created_at, '
+                'updated_at, verified_by, verified_at, questioned_by, '
+                'questioned_at, error '
+                'FROM episode_queue WHERE id=?',
+                (row_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            'id': row['id'],
+            'status': row['status'],
+            'group_id': row['group_id'],
+            'name': row['name'],
+            'episode_body': row['episode_body'],
+            'created_at': row['created_at'],
+            'updated_at': row['updated_at'],
+            'verified_by': row['verified_by'],
+            'verified_at': row['verified_at'],
+            'questioned_by': row['questioned_by'],
+            'questioned_at': row['questioned_at'],
+            'error': row['error'],
+            'materialized': False,
+        }
+
     async def mark_failed(self, row_id: int, error: str, worker_id: str | None = None) -> bool:
         """Move an exhausted row to failed/ for manual re-add (analogous to the spool).
 
@@ -609,28 +748,41 @@ class QueueJournal:
             )
             return cur.rowcount > 0
 
-    async def requeue_stale_except(self, worker_id: str, grace_seconds: float) -> int:
+    async def requeue_stale_except(
+        self, worker_ids: str | set[str] | None, grace_seconds: float
+    ) -> int:
         """Requeue processing rows whose owner vanished, never stealing our own.
 
         Only rows whose lease expired more than ``grace_seconds`` ago AND that
         are owned by a different worker (or none) are taken back to ``pending``.
-        The current worker's rows are never stolen - even after their lease - so
+        The current workers' rows are never stolen - even after their lease - so
         a long in-flight LLM call on this process can never be double-processed;
         such rows are healed by ``requeue_stale()`` on the next boot instead.
+
+        ``worker_ids`` may be a single worker id or a SET of ids owned by this
+        process (RCA C10: a process can run several pool workers, each with its
+        own unique worker_id); ``None`` excludes nobody.
         """
-        cutoff = _later_iso(-grace_seconds)
+        if isinstance(worker_ids, str):
+            worker_ids = {worker_ids}
+        owner_guard = ''
+        params: tuple = (_now_iso(), _later_iso(-grace_seconds))
+        if worker_ids:
+            placeholders = ', '.join('?' for _ in worker_ids)
+            owner_guard = f' AND (worker_id IS NULL OR worker_id NOT IN ({placeholders}))'
+            params = params + tuple(worker_ids)
         sql = (
             'UPDATE episode_queue SET status=\'pending\', worker_id=NULL, '
             'lease_until=NULL, error=\'requeued stale claim\', updated_at=? '
-            "WHERE status='processing' AND (lease_until IS NULL OR lease_until <= ?) "
-            'AND (worker_id IS NULL OR worker_id <> ?)'
+            "WHERE status='processing' AND (lease_until IS NULL OR lease_until <= ?)"
+            + owner_guard
         )
         async with self._lock:
             cur = await asyncio.to_thread(
                 self._exec_commit_sync,
                 self._conn,
                 sql,
-                (_now_iso(), cutoff, worker_id),
+                params,
             )
             return cur.rowcount
 
@@ -667,6 +819,41 @@ class QueueJournal:
                 self._conn,
                 sql,
                 (_now_iso(), row_id, worker_id, cutoff),
+            )
+            return cur.rowcount > 0
+
+    async def release_own_row(
+        self,
+        row_id: int,
+        worker_id: str,
+        error: str = 'no progress: forced requeue of own row',
+    ) -> bool:
+        """Force-requeue OUR OWN processing row to ``pending`` regardless of lease.
+
+        The lease-based watchdog only heals a row whose lease EXPIRED; a live
+        heartbeat can keep renewing the lease forever while the worker is stuck
+        without any progress (observed: an episode stuck 30+ min inside the
+        failover chain, heartbeat renewing every 150s, zero LLM calls). This
+        method is the wall-clock backstop: when a row has been ``processing``
+        too long (beyond ``journal_processing_timeout``) it is released here no
+        matter how fresh the lease is, so the claim/steal guards never dead-lock
+        on a zombie that still "owns" its slot.
+
+        ``attempt`` is incremented and ``next_retry_at`` cleared so the requeued
+        row becomes immediately claimable. Returns True when the row was
+        released (still processed-owned), False otherwise.
+        """
+        sql = (
+            "UPDATE episode_queue SET status='pending', attempt=attempt+1, "
+            "worker_id=NULL, lease_until=NULL, next_retry_at=NULL, error=?, updated_at=? "
+            "WHERE id=? AND worker_id=? AND status='processing'"
+        )
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._exec_commit_sync,
+                self._conn,
+                sql,
+                (error, _now_iso(), row_id, worker_id),
             )
             return cur.rowcount > 0
 
@@ -772,6 +959,44 @@ class QueueJournal:
             )
             return {str(r[0]): int(r[1]) for r in cur.fetchall()}
 
+    async def has_due_serial_safe(self, group_id: str) -> bool:
+        """Whether the group holds a due pending row a FOLLOWER may claim.
+
+        Follower claims require ``requires_serial = 0`` (an explicit, already
+        written ``previous_episode_uuids`` / ``saga_previous_episode_uuid``)
+        AND a due ``next_retry_at``. Used by ``_pick_group(leader=False)`` so a
+        worker never spins up a follower claim for a group that only has serial
+        or backed-off rows (the leader owns those).
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._conn.execute,
+                "SELECT 1 FROM episode_queue "
+                "WHERE group_id = ? AND status = 'pending' AND requires_serial = 0 "
+                "AND (next_retry_at IS NULL OR next_retry_at <= ?) LIMIT 1",
+                (group_id, _now_iso()),
+            )
+            return cur.fetchone() is not None
+
+    async def last_done_uuid(self, group_id: str) -> str | None:
+        """Return the uuid of the newest ``done`` row for a group, or None.
+
+        A ``done`` journal row was fully processed by ``add_episode``, so its
+        episode is materialized in the graph - the safe single predecessor to
+        pass as ``previous_episode_uuids`` for a follow-up episode whose context
+        should skip auto-retrieval (making them parallel-safe).
+        """
+        async with self._lock:
+            cur = await asyncio.to_thread(
+                self._conn.execute,
+                "SELECT uuid FROM episode_queue "
+                "WHERE group_id = ? AND status = 'done' AND uuid IS NOT NULL "
+                'ORDER BY id DESC LIMIT 1',
+                (group_id,),
+            )
+            row = cur.fetchone()
+        return str(row[0]) if row is not None else None
+
     async def stats(self) -> dict[str, int]:
         """One-shot counts of every status bucket plus the total."""
         pending = await self.count_pending()
@@ -851,8 +1076,9 @@ class QueueJournal:
 
         Returns:
             List of ``{id, status, group_id, name, snippet, created_at,
-            updated_at, verified_by, verified_at, materialized}`` dicts, newest
-            first. Empty query / non-positive limit return an empty list.
+            updated_at, verified_by, verified_at, questioned_by, questioned_at,
+            materialized}`` dicts, newest first. Empty query / non-positive
+            limit return an empty list.
         """
         if not query or not query.strip() or limit < 1:
             return []
@@ -867,7 +1093,7 @@ class QueueJournal:
         params.append(int(limit))
         sql = (
             'SELECT id, status, group_id, name, episode_body, created_at, updated_at, '
-            'verified_by, verified_at '
+            'verified_by, verified_at, questioned_by, questioned_at '
             f'FROM episode_queue WHERE {where} ORDER BY id DESC LIMIT ?'
         )
         async with self._lock:
@@ -883,6 +1109,8 @@ class QueueJournal:
                 'updated_at': row['updated_at'],
                 'verified_by': row['verified_by'],
                 'verified_at': row['verified_at'],
+                'questioned_by': row['questioned_by'],
+                'questioned_at': row['questioned_at'],
                 'materialized': False,
             }
             for row in rows

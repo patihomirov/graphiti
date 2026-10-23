@@ -34,6 +34,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
 
+
+def _usage_summary(usage: Any) -> str:
+    """Serialize a completion usage object for diagnostics (best-effort).
+
+    Providers differ in whether ``usage`` is present and which fields it carries;
+    ``getattr`` keeps this safe for any OpenAI-compatible response.
+    """
+    if usage is None:
+        return 'usage=None'
+    prompt = getattr(usage, 'prompt_tokens', None)
+    completion = getattr(usage, 'completion_tokens', None)
+    total = getattr(usage, 'total_tokens', None)
+    return f'prompt_tokens={prompt} completion_tokens={completion} total_tokens={total}'
+
 StructuredOutputMode = Literal['json_schema', 'json_object']
 
 
@@ -95,7 +109,14 @@ class OpenAIGenericClient(LLMClient):
         self.structured_output_mode: StructuredOutputMode = structured_output_mode
 
         if client is None:
-            self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+            # max_retries=0: the SDK's built-in retry (default 2, with its own
+            # hidden backoff) silently multiplies the request rate on a 429 /
+            # 5xx storm. Retries are owned by the LLMClient tenacity layer,
+            # which respects Retry-After, so the SDK must never re-drive the
+            # call underneath it.
+            self.client = AsyncOpenAI(
+                api_key=config.api_key, base_url=config.base_url, max_retries=0
+            )
         else:
             self.client = client
 
@@ -159,16 +180,55 @@ class OpenAIGenericClient(LLMClient):
                 max_tokens=max_tokens,
                 response_format=self._build_response_format(response_model),  # type: ignore[arg-type]
             )
-            result = response.choices[0].message.content or ''
+            choice = response.choices[0]
+            result = choice.message.content or ''
+            finish_reason = getattr(choice, 'finish_reason', None)
+            reasoning_content = getattr(choice.message, 'reasoning_content', None)
+            reasoning_len = len(reasoning_content) if reasoning_content else 0
+            usage_summary = _usage_summary(getattr(response, 'usage', None))
+            model_used = self.model_override or self.model or DEFAULT_MODEL
             # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
             # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
             if not result:
+                logger.warning(
+                    'LLM empty response: model=%s max_tokens=%s finish_reason=%s '
+                    'len(content)=0 len(reasoning_content)=%d usage=%s',
+                    model_used,
+                    max_tokens,
+                    finish_reason,
+                    reasoning_len,
+                    usage_summary,
+                )
                 raise EmptyResponseError('LLM returned an empty response')
+            logger.debug(
+                'LLM response: model=%s max_tokens=%s finish_reason=%s len(content)=%d '
+                'len(reasoning_content)=%d usage=%s',
+                model_used,
+                max_tokens,
+                finish_reason,
+                len(result),
+                reasoning_len,
+                usage_summary,
+            )
             # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
             # structured response_format; strip it before parsing.
             return json.loads(self._strip_code_fences(result))
         except openai.RateLimitError as e:
-            raise RateLimitError from e
+            # Surface the provider's Retry-After onto our RateLimitError so the
+            # tenacity retry, the circuit breaker and the storm throttle can all
+            # honour it. The header lives on e.response.headers (httpx); best
+            # effort — absent/unparseable hint degrades to None.
+            retry_after = None
+            response = getattr(e, 'response', None)
+            headers = getattr(response, 'headers', None)
+            if headers is not None:
+                value = headers.get('retry-after')
+                if value:
+                    try:
+                        retry_after = max(0.0, float(value))
+                    except (TypeError, ValueError):
+                        retry_after = None
+            raise RateLimitError(retry_after=retry_after) from e
         except Exception as e:
             logger.error(f'Error in generating LLM response: {e}')
             raise

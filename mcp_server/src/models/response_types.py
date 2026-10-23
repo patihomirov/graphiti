@@ -13,6 +13,13 @@ class SuccessResponse(TypedDict):
     message: str
 
 
+class AddMemoryResponse(TypedDict):
+    message: str
+    status: str
+    journal_id: int | None
+    materialized: bool
+
+
 class NodeResult(TypedDict):
     uuid: str
     name: str

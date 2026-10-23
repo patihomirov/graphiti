@@ -1,12 +1,12 @@
 """Factory classes for creating LLM, Embedder, and Database clients."""
 
+from config.schema import DatabaseConfig, EmbedderConfig, LLMConfig
+
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
-
-from config.schema import DatabaseConfig, EmbedderConfig, LLMConfig
 
 # Try to import FalkorDriver if available
 try:
@@ -89,6 +89,50 @@ def _validate_api_key(provider_name: str, api_key: str | None, logger) -> str:
     logger.info(f'Creating {provider_name} client')
 
     return api_key
+
+
+def resolve_api_key(api_key: str | None, provider_name: str = 'ZAI') -> str:
+    """Resolve an API key that may be a literal value or a ``{file:...}`` reference.
+
+    Secrets must never live in the config file / repo, so the zai vendor token is
+    referenced by path (the same ``{file:{env:VAR}/...}`` ozon pattern used by the
+    opencode zai provider). Literal keys (existing providers) are returned
+    unchanged. Supported forms:
+
+    - ``{file:/abs/path/to/token}``
+    - ``{file:{env:HOME}/.o3-cli/zai_vendor_token}`` (env var expanded, ``~`` expanded)
+
+    The resolved secret is never logged.
+    """
+    import os
+    import re
+
+    if not api_key:
+        raise ValueError(
+            f'{provider_name} API key is not configured. '
+            'Set the appropriate environment variable.'
+        )
+    if not api_key.startswith('{file:'):
+        return api_key
+    if not api_key.endswith('}'):
+        raise ValueError(f'{provider_name} API key reference is malformed: {api_key!r}')
+    inner = api_key[len('{file:') : -1]
+
+    def _env(match: re.Match) -> str:
+        return os.environ.get(match.group(1), '')
+
+    inner = re.sub(r'\{env:([^}]+)\}', _env, inner)
+    path = os.path.expanduser(inner or '')
+    if not path:
+        raise ValueError(f'{provider_name} API key file reference resolved to an empty path')
+    try:
+        with open(path, encoding='utf-8') as f:
+            token = f.read().strip()
+    except OSError as e:
+        raise ValueError(f'{provider_name} API key file {path} is not readable: {e}') from e
+    if not token:
+        raise ValueError(f'{provider_name} API key file {path} is empty')
+    return token
 
 
 def is_non_openai_provider(base_url: str | None) -> bool:
@@ -301,6 +345,61 @@ class LLMClientFactory:
 
             case _:
                 raise ValueError(f'Unsupported LLM provider: {provider}')
+
+    @staticmethod
+    def create_zai(
+        config: LLMConfig,
+        zai_model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> OpenAIGenericClient:
+        """Create the zai (Z.AI via local proxy) overflow extraction client.
+
+        Feature B: a SECOND OpenAIGenericClient pointed at the zai provider slot
+        (``providers.zai``), which routes to the local o3-plugin-agent proxy
+        (http://127.0.0.4:3128/zai/openai/v1) and thereby a separate provider
+        quota - the only thing that genuinely relieves an ozon 429 storm. The
+        proxy is OpenAI-compatible, so the generic client is used; structured
+        output stays in ``json_object`` mode (json_schema support on the zai
+        proxy is not confirmed). The model id is provider-qualified
+        (``zai/glm-5.3``) and doubles as the ``(provider, model)`` channel key.
+        ``max_tokens`` defaults to the active model's budget with headroom for
+        zai reasoning models.
+
+        Args:
+            config: The LLM config (providers.zai must be set).
+            zai_model: Override channel key (provider-qualified id, e.g.
+                ``zai/glm-5.3``). Defaults to ``providers.zai.model`` if set
+                else the standard ``'zai/glm-5.3'``.
+            max_tokens: Max tokens for the zai client. Defaults to
+                ``max(config.max_tokens, 8192)``.
+        """
+        if not config.providers.zai:
+            raise ValueError('ZAI provider configuration not found')
+        api_key = resolve_api_key(config.providers.zai.api_key, provider_name='ZAI')
+        model = zai_model or getattr(config.providers.zai, 'model', None) or 'zai/glm-5.3'
+        # The channel key is provider-qualified (``zai/glm-5.3``) for the
+        # (provider, model) failover semantics, but the local proxy expects the
+        # BARE model id on the wire (``glm-5.3``): strip the ``zai/`` prefix.
+        wire_model = model.split('/', 1)[1] if model.startswith('zai/') else model
+        token_budget = max(int(config.max_tokens), 8192) if max_tokens is None else int(max_tokens)
+
+        from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
+
+        llm_config = CoreLLMConfig(
+            api_key=api_key,
+            model=wire_model,
+            small_model=wire_model,
+            # None is intentional: reasoning models omit temperature; the zai
+            # proxy forwards it verbatim so never send what the model rejects.
+            temperature=None,
+            max_tokens=token_budget,
+            base_url=config.providers.zai.api_url,
+        )
+        return OpenAIGenericClient(
+            config=llm_config,
+            max_tokens=token_budget,
+            structured_output_mode='json_object',
+        )
 
 
 class EmbedderFactory:

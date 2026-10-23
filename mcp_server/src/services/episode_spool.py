@@ -182,6 +182,7 @@ class EpisodeRetryer:
         interval_seconds: float = 15.0,
         max_attempts: int = 10,
         backoff_base_seconds: float = 30.0,
+        backoff_cap_seconds: float = 480.0,
     ):
         self.spool = spool
         self.breaker = breaker
@@ -190,6 +191,11 @@ class EpisodeRetryer:
         self.interval_seconds = float(interval_seconds)
         self.max_attempts = int(max_attempts)
         self.backoff_base_seconds = float(backoff_base_seconds)
+        # 2026-10-22 backoff-cap: cap the exponential due-window so spooled
+        # episodes cannot fall asleep for hours (30s base x 2^n reaches ~32 min
+        # by attempt 7 and >4h by attempt 10). Mirrors resilience
+        # retry_backoff_cap_seconds used by the journal path.
+        self.backoff_cap_seconds = float(backoff_cap_seconds)
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -255,6 +261,9 @@ class EpisodeRetryer:
         except (TypeError, ValueError):
             return True
         delay = self.backoff_base_seconds * (2 ** (attempt - 1))
+        cap = self.backoff_cap_seconds
+        if delay > cap:
+            delay = cap
         elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
         return elapsed >= delay
 

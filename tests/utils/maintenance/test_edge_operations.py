@@ -183,6 +183,10 @@ async def test_resolve_extracted_edges_keeps_unknown_names(monkeypatch):
         embedder=MagicMock(),
         cross_encoder=MagicMock(),
     )
+    # resolve_extracted_edges precomputes the edge query vectors via a single
+    # embedder.create_batch call (frequency-opt 2026-10-22); stub it explicitly so
+    # the mocked embedder does not blow up on await.
+    clients.embedder.create_batch = AsyncMock(return_value=[[0.0] * 1024])
 
     source_node = EntityNode(
         uuid='source_uuid',
@@ -372,6 +376,10 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
         embedder=MagicMock(),
         cross_encoder=MagicMock(),
     )
+    # resolve_extracted_edges precomputes the edge query vectors via a single
+    # embedder.create_batch call (frequency-opt 2026-10-22); stub it explicitly so
+    # the mocked embedder does not blow up on await.
+    clients.embedder.create_batch = AsyncMock(return_value=[[0.0] * 1024])
 
     source_node = EntityNode(
         uuid='source_uuid',

@@ -16,10 +16,21 @@ limitations under the License.
 
 
 class RateLimitError(Exception):
-    """Exception raised when the rate limit is exceeded."""
+    """Exception raised when the rate limit is exceeded.
 
-    def __init__(self, message='Rate limit exceeded. Please try again later.'):
+    ``retry_after`` (seconds) carries the provider's Retry-After hint when one
+    was present on the triggering response, so retry logic and the storm
+    throttle can honour it instead of hammering the gateway as it asks us to
+    slow down. ``None`` when no hint was conveyed.
+    """
+
+    def __init__(
+        self,
+        message: str = 'Rate limit exceeded. Please try again later.',
+        retry_after: float | None = None,
+    ):
         self.message = message
+        self.retry_after = float(retry_after) if retry_after is not None else None
         super().__init__(self.message)
 
 

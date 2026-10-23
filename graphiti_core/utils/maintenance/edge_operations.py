@@ -138,7 +138,7 @@ async def extract_edges(
 
     start = time()
 
-    extract_edges_max_tokens = 16384
+    extract_edges_max_tokens = 32768
     llm_client = clients.llm_client
 
     # Build mapping from edge type name to list of valid signatures
@@ -389,6 +389,27 @@ async def resolve_extracted_edges(
                         valid_edges_list[i].append(oe)
                         existing_uuids.add(oe.uuid)
 
+    # Both graph searches below (related-edge and edge-invalidation) query by the
+    # SAME text - edge.fact - via EDGE_HYBRID_SEARCH_RRF (bm25 + cosine). Embed
+    # each fact ONCE in a single batched call and reuse that vector for both
+    # searches instead of the previous two per-edge embeds. This halves the
+    # embedding traffic of this section (2E -> E per episode) and collapses the
+    # per-edge embedding fan-out into one batched HTTP request.
+    query_texts = [edge.fact.replace('\n', ' ') for edge in extracted_edges]
+    if query_texts:
+        embedded_vectors = await embedder.create_batch(query_texts)
+    else:
+        embedded_vectors = []
+
+    def _search_query_vector(index: int) -> list[float] | None:
+        # A missing vector (empty query, or a len-mismatched batch) degrades to
+        # search()'s legacy embed-on-demand path.
+        try:
+            vector = embedded_vectors[index]
+        except IndexError:
+            return None
+        return vector if vector is not None and isinstance(vector, list) else None
+
     related_edges_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
@@ -397,8 +418,11 @@ async def resolve_extracted_edges(
                 group_ids=[extracted_edge.group_id],
                 config=EDGE_HYBRID_SEARCH_RRF,
                 search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
+                query_vector=_search_query_vector(i),
             )
-            for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
+            for i, (extracted_edge, valid_edges) in enumerate(
+                zip(extracted_edges, valid_edges_list, strict=True)
+            )
         ]
     )
 
@@ -412,8 +436,9 @@ async def resolve_extracted_edges(
                 group_ids=[extracted_edge.group_id],
                 config=EDGE_HYBRID_SEARCH_RRF,
                 search_filter=SearchFilters(),
+                query_vector=_search_query_vector(i),
             )
-            for extracted_edge in extracted_edges
+            for i, extracted_edge in enumerate(extracted_edges)
         ]
     )
 
