@@ -47,6 +47,7 @@ from graphiti_core.helpers import (
     validate_group_id,
 )
 from graphiti_core.llm_client import LLMClient, OpenAIClient
+from graphiti_core.models.nodes.node_db_queries import get_entity_node_return_query
 from graphiti_core.namespaces import EdgeNamespace, NodeNamespace
 from graphiti_core.nodes import (
     CommunityNode,
@@ -56,6 +57,7 @@ from graphiti_core.nodes import (
     Node,
     SagaNode,
     create_entity_node_embeddings,
+    get_entity_node_from_record,
 )
 from graphiti_core.prompts.lib import prompt_library
 from graphiti_core.prompts.summarize_sagas import SagaSummary
@@ -83,6 +85,7 @@ from graphiti_core.utils.bulk_utils import (
     retrieve_previous_episodes_bulk,
 )
 from graphiti_core.utils.datetime_utils import utc_now
+from graphiti_core.utils.maintenance.combined_extraction import extract_nodes_and_edges
 from graphiti_core.utils.maintenance.community_operations import (
     build_communities,
     remove_communities,
@@ -1058,6 +1061,8 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        fast_lane: bool = False,
+        fast_lane_prev_episodes: int = 3,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -1105,6 +1110,18 @@ class Graphiti:
             query to find the most recent episode. Useful for efficiently adding multiple episodes
             to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
             as this parameter for the next episode.
+        fast_lane : bool
+            Optional. Route this episode through the fast-lane path (2026-10-24): ONE
+            combined LLM extraction call (nodes + edges + timestamps) instead of the
+            legacy 15-40 sequential calls, plus a deterministic LLM-free exact-match of
+            extracted nodes against existing graph nodes (reusing their UUIDs and
+            preserving summary/attributes). Intended for simple, small episodes where
+            gateway latency (~5s/call) dominates. Defaults to False (legacy path).
+        fast_lane_prev_episodes : int
+            Optional. Previous-episode context window used by the fast-lane path when
+            auto-retrieving context (no explicit ``previous_episode_uuids``). Defaults
+            to 3, matching ``RELEVANT_SCHEMA_LIMIT``. Reserved tuning knob; the MCP
+            server does not wire it (uses this default).
 
         Returns
         -------
@@ -1140,11 +1157,13 @@ class Graphiti:
 
         with self.tracer.start_span('add_episode') as span:
             try:
-                # Retrieve previous episodes for context
+                # Retrieve previous episodes for context. The fast-lane path uses a
+                # narrower window (fast_lane_prev_episodes, default 3) to keep the
+                # single combined LLM call as short as possible.
                 previous_episodes = (
                     await self.retrieve_episodes(
                         reference_time,
-                        last_n=RELEVANT_SCHEMA_LIMIT,
+                        last_n=fast_lane_prev_episodes if fast_lane else RELEVANT_SCHEMA_LIMIT,
                         group_ids=[group_id],
                         source=source,
                         driver=driver,
@@ -1175,6 +1194,31 @@ class Graphiti:
                     if edge_types is not None
                     else {('Entity', 'Entity'): []}
                 )
+
+                # Fast-lane (2026-10-24): simple small episodes are extracted with ONE
+                # combined LLM call + a deterministic DB exact-match instead of the
+                # legacy 15-40 sequential LLM calls. The write path (_process_episode_data)
+                # and the result shape are identical to the legacy flow.
+                if fast_lane:
+                    return await self._add_episode_fast_lane(
+                        episode=episode,
+                        previous_episodes=previous_episodes,
+                        now=now,
+                        start=start,
+                        group_id=group_id,
+                        source=source,
+                        reference_time=reference_time,
+                        update_communities=update_communities,
+                        entity_types=entity_types,
+                        excluded_entity_types=excluded_entity_types,
+                        edge_types=edge_types,
+                        edge_type_map=edge_type_map or edge_type_map_default,
+                        custom_extraction_instructions=custom_extraction_instructions,
+                        saga=saga,
+                        saga_previous_episode_uuid=saga_previous_episode_uuid,
+                        clients=clients,
+                        span=span,
+                    )
 
                 # Extract and resolve nodes
                 extracted_nodes, node_episode_index_map = await extract_nodes(
@@ -1286,6 +1330,218 @@ class Graphiti:
                 span.set_status('error', str(e))
                 span.record_exception(e)
                 raise e
+
+    async def _add_episode_fast_lane(
+        self,
+        *,
+        episode: EpisodicNode,
+        previous_episodes: list[EpisodicNode],
+        now: datetime,
+        start: float,
+        group_id: str,
+        source: EpisodeType,
+        reference_time: datetime,
+        update_communities: bool,
+        entity_types: dict[str, type[BaseModel]] | None,
+        excluded_entity_types: list[str] | None,
+        edge_types: dict[str, type[BaseModel]] | None,
+        edge_type_map: dict[tuple[str, str], list[str]] | None,
+        custom_extraction_instructions: str | None,
+        saga: str | SagaNode | None,
+        saga_previous_episode_uuid: str | None,
+        clients: GraphitiClients,
+        span,
+    ) -> AddEpisodeResults:
+        """Fast-lane episode processing: one combined LLM extraction call.
+
+        Fast-lane rationale (2026-10-24): the gateway median latency is ~5s per LLM
+        call and a legacy episode runs 15-40 sequential calls, so simple small
+        episodes spend 11-22 min mostly on latency. The fast-lane path collapses that
+        to a single combined ``extract_nodes_and_edges`` call plus a deterministic,
+        LLM-free exact-match of extracted nodes against the live graph (reusing
+        existing node UUIDs and preserving their summary/attributes). Per-node
+        attribute extraction is skipped entirely when every entity type is
+        documentation-only (the fast-exit would return unchanged attributes anyway).
+
+        Persistence is NOT duplicated: the episode goes through the same
+        ``_process_episode_data`` bulk-write as the legacy path, so the stored format
+        is identical and no graph migration is needed. Community refresh is skipped by
+        default (``update_communities`` is False unless explicitly requested).
+        """
+        # 1. ONE combined LLM call (nodes + edges + batch timestamps).
+        extracted_nodes, extracted_edges, node_episode_index_map = await extract_nodes_and_edges(
+            clients,
+            episode,
+            previous_episodes,
+            entity_types=entity_types,
+            excluded_entity_types=excluded_entity_types,
+            edge_type_map=edge_type_map,
+            edge_types=edge_types,
+            custom_extraction_instructions=custom_extraction_instructions,
+        )
+
+        # 2. Deterministic exact-match against the live graph (no LLM). Extract the
+        #    fresh->resolved uuid mapping BEFORE mutating node uuids so edges can be
+        #    re-pointed onto reused uuids.
+        existing_by_name = await self._exact_match_existing_nodes(
+            clients.driver, extracted_nodes, group_id
+        )
+        fresh_to_resolved: dict[str, str] = {}
+        nodes: list[EntityNode] = []
+        for node in extracted_nodes:
+            existing = existing_by_name.get(node.name.lower())
+            resolved_uuid = existing.uuid if existing is not None else node.uuid
+            fresh_to_resolved[node.uuid] = resolved_uuid
+            if existing is not None:
+                # Reuse the existing node (no duplicate in the graph) and preserve its
+                # summary/attributes/created_at: the bulk save does ``SET n = node``,
+                # which would otherwise overwrite them with empty/fresh values
+                # (legacy resolution keeps the canonical node's created_at).
+                node.uuid = resolved_uuid
+                node.summary = existing.summary
+                node.attributes = existing.attributes
+                node.created_at = existing.created_at
+            nodes.append(node)
+
+        for edge in extracted_edges:
+            edge.source_node_uuid = fresh_to_resolved.get(
+                edge.source_node_uuid, edge.source_node_uuid
+            )
+            edge.target_node_uuid = fresh_to_resolved.get(
+                edge.target_node_uuid, edge.target_node_uuid
+            )
+
+        # Re-key the episode-attribution map onto resolved uuids (defensively merge in
+        # case two fresh nodes ever collapse onto the same resolved uuid).
+        rekeyed_episode_map: dict[str, list[int]] = {}
+        for fresh_uuid, indices in node_episode_index_map.items():
+            resolved = fresh_to_resolved.get(fresh_uuid, fresh_uuid)
+            rekeyed_episode_map[resolved] = sorted(
+                set(rekeyed_episode_map.get(resolved, []) + indices)
+            )
+        node_episode_index_map = rekeyed_episode_map
+
+        # 3. Attributes: doc-only types -> skip (0 LLM calls); rich types -> legacy path.
+        if not self._entity_types_are_doc_only(entity_types):
+            nodes = await extract_attributes_from_nodes(
+                clients,
+                nodes,
+                episode,
+                previous_episodes,
+                entity_types,
+                edges=extracted_edges,
+            )
+
+        # 4. Persist through the exact same bulk-write as the legacy path.
+        episodic_edges, episode = await self._process_episode_data(
+            episode,
+            nodes,
+            extracted_edges,
+            now,
+            group_id,
+            saga,
+            saga_previous_episode_uuid,
+            node_episode_index_map,
+            clients=clients,
+        )
+
+        # 5. Community refresh only when explicitly requested (default off).
+        communities: list[CommunityNode] = []
+        community_edges: list[CommunityEdge] = []
+        if update_communities:
+            communities, community_edges = await semaphore_gather(
+                *[
+                    update_community(
+                        clients.driver, clients.llm_client, clients.embedder, node
+                    )
+                    for node in nodes
+                ],
+                max_coroutines=self.max_coroutines,
+            )
+
+        end = time()
+        span.add_attributes(
+            {
+                'episode.uuid': episode.uuid,
+                'episode.source': source.value,
+                'episode.reference_time': reference_time.isoformat(),
+                'group_id': group_id,
+                'node.count': len(nodes),
+                'edge.count': len(extracted_edges),
+                'previous_episodes.count': len(previous_episodes),
+                'entity_types.count': len(entity_types) if entity_types else 0,
+                'edge_types.count': len(edge_types) if edge_types else 0,
+                'fast_lane': True,
+                'duration_ms': (end - start) * 1000,
+            }
+        )
+        logger.info(f'Completed add_episode (fast-lane) in {(end - start) * 1000} ms')
+
+        return AddEpisodeResults(
+            episode=episode,
+            episodic_edges=episodic_edges,
+            nodes=nodes,
+            edges=extracted_edges,
+            communities=communities,
+            community_edges=community_edges,
+        )
+
+    @staticmethod
+    async def _exact_match_existing_nodes(
+        driver: GraphDriver,
+        extracted_nodes: list[EntityNode],
+        group_id: str,
+    ) -> dict[str, EntityNode]:
+        """Deterministic, LLM-free exact-match of extracted names against live nodes.
+
+        Returns a map ``lowered_name -> existing EntityNode`` for the matched nodes in
+        the episode's group. Matching is case-insensitive on the node name; it is
+        deliberately NOT semantic/fuzzy — the fast-lane path avoids LLM dedup calls for
+        speed, accepting that only exact name matches are de-duplicated.
+        """
+        if not extracted_nodes:
+            return {}
+        names = sorted({n.name.lower() for n in extracted_nodes if n.name})
+        if not names:
+            return {}
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (n:Entity)
+            WHERE n.group_id = $group_id AND toLower(n.name) IN $names
+            RETURN
+            """
+            + get_entity_node_return_query(driver.provider),
+            group_id=group_id,
+            names=names,
+            routing_='r',
+        )
+        existing_by_name: dict[str, EntityNode] = {}
+        for record in records:
+            node = get_entity_node_from_record(record, driver.provider)
+            if node is None or not node.name:
+                continue
+            normalized = node.name.lower()
+            current = existing_by_name.get(normalized)
+            # Prefer the newest node if the DB ever holds duplicate names.
+            if current is None or (node.created_at and (
+                current.created_at is None or node.created_at > current.created_at
+            )):
+                existing_by_name[normalized] = node
+        return existing_by_name
+
+    @staticmethod
+    def _entity_types_are_doc_only(
+        entity_types: dict[str, type[BaseModel]] | None,
+    ) -> bool:
+        """Whether every configured entity type has no Pydantic fields.
+
+        When True (or no types are configured) the per-node attribute extraction LLM
+        calls are skipped in the fast-lane path — the extraction fast-exit would return
+        the unchanged attributes, so calling it would only burn latency.
+        """
+        if not entity_types:
+            return True
+        return all(len(model.model_fields) == 0 for model in entity_types.values())
 
     async def add_episode_bulk(
         self,

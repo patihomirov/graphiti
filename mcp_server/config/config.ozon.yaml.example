@@ -152,3 +152,16 @@ resilience:
   # порядок (active первый). Порог 2 = одиночный таймаут это шум, поток — деградация.
   zai_first_timeout_window_seconds: 300.0
   zai_first_timeout_threshold: 2
+  # --- Fast-lane (2026-10-24) ---
+  # Simple small episodes are extracted with ONE combined LLM call + a deterministic
+  # DB exact-match instead of the legacy 15-40 sequential calls (gateway ~5s/call;
+  # expected 6-10x speedup for <5KB episodes).
+  fast_lane_enabled: true
+  # Bodies at or below this size (UTF-8 bytes) are eligible for the fast-lane path.
+  fast_lane_max_body_bytes: 5120
+  # Previous-episode context window for the fast-lane path (kernel default; the MCP
+  # server does not wire it - 3 matches RELEVANT_SCHEMA_LIMIT).
+  fast_lane_prev_episodes: 3
+  # Treat ALL configured entity types as documentation-only (no fields) so per-node
+  # attribute extraction LLM calls are skipped engine-wide (legacy + fast-lane).
+  entity_attributes_doc_only: true

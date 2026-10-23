@@ -289,7 +289,13 @@ class GraphitiService:
             # Build entity / edge types from configuration. Rich Pydantic models
             # registered in models.entity_types / models.edge_types are preferred;
             # otherwise documentation-only models are built from the description.
-            self.entity_types = build_entity_types(self.config.graphiti.entity_types)
+            # When resilience.entity_attributes_doc_only is set (fast-lane project),
+            # ALL entity types are forced to documentation-only so the per-node
+            # attribute extraction LLM calls are skipped engine-wide.
+            self.entity_types = build_entity_types(
+                self.config.graphiti.entity_types,
+                entity_attributes_doc_only=self.config.resilience.entity_attributes_doc_only,
+            )
             self.edge_types = build_edge_types(self.config.graphiti.edge_types)
             self.edge_type_map = build_edge_type_map(self.config.graphiti.edge_type_map)
 

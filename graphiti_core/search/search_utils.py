@@ -61,7 +61,11 @@ from graphiti_core.search.search_filters import (
 
 logger = logging.getLogger(__name__)
 
-RELEVANT_SCHEMA_LIMIT = 10
+# Previous-episode context window used for extraction prompts. Reduced from 10 to 3
+# for the fast-lane project (2026-10-24): the gateway latency is ~5s per LLM call and
+# each episode historically triggered 15-40 sequential calls, so the context must stay
+# small. Affects legacy add_episode and add_episode_bulk equally (intentional).
+RELEVANT_SCHEMA_LIMIT = 3
 DEFAULT_MIN_SCORE = 0.6
 DEFAULT_MMR_LAMBDA = 0.5
 MAX_SEARCH_DEPTH = 3

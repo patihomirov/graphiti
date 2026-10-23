@@ -439,6 +439,33 @@ class ResilienceConfig(BaseModel):
         'sits above the worst observed add_episode (~1350s); the per-row watchdog '
         '(lease_seconds + journal_grace_seconds) still covers the heartbeat path.',
     )
+    fast_lane_enabled: bool = Field(
+        default=True,
+        description='Enable the fast-lane episode path: simple small episodes are '
+        'extracted with a single combined LLM call plus at most one small call, '
+        'instead of the legacy 15-40 sequential calls (gateway latency ~5s/call).',
+    )
+    fast_lane_max_body_bytes: int = Field(
+        default=5120,
+        ge=0,
+        description='Episodic bodies at or below this size (UTF-8 bytes) are eligible '
+        'for the fast-lane combined extraction path. Larger episodes keep the legacy '
+        'multi-call extraction. 5120 sits above the ~5KB threshold used to classify '
+        'simple episodes.',
+    )
+    fast_lane_prev_episodes: int = Field(
+        default=3,
+        ge=0,
+        description='Previous-episode context window for the fast-lane path. The '
+        'kernel fast-lane branch defaults to this value (3, matching '
+        'RELEVANT_SCHEMA_LIMIT); reserved here as the documented tuning knob.',
+    )
+    entity_attributes_doc_only: bool = Field(
+        default=True,
+        description='Treat every configured entity type as documentation-only (no '
+        'Pydantic fields) so per-node attribute extraction LLM calls are skipped '
+        'entirely. Global: applies to the legacy and the fast-lane paths.',
+    )
     model_fallbacks: list[str] = Field(
         default_factory=list,
         description=(

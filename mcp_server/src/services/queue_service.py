@@ -616,6 +616,13 @@ class QueueService:
             if self._episode_builder is None:  # guarded by caller, defensive
                 raise RuntimeError('No episode_builder configured for journal processing')
             kwargs = self._episode_builder(plan)
+            # Fast-lane routing (2026-10-24): a small, simple episode goes through the
+            # single combined LLM-call extraction path in graphiti-core. The routing is
+            # deliberately tolerant: any config/field/parse problem falls back to the
+            # legacy path (fast_lane absent -> False) so a bad value can never regress
+            # correctness, only speed.
+            if self._should_fast_lane(plan):
+                kwargs['fast_lane'] = True
             # Multi-model failover (phase 3, variant 'b'): the whole episode is
             # processed by a single chosen model; on a transient failure (429 /
             # empty response / transport / malformed JSON) the worker retries the
@@ -698,6 +705,24 @@ class QueueService:
         else:
             repeat_count = 1
         return signature, repeat_count
+
+    def _should_fast_lane(self, plan: dict[str, Any]) -> bool:
+        """Whether a persisted journal plan belongs on the fast-lane path.
+
+        Fast-lane eligibility (2026-10-24): the resilience flag is on AND the
+        episode body is small enough that one combined LLM call suffices. Any
+        config/field/parse problem returns False (legacy path) — robustness first.
+        """
+        try:
+            if not getattr(self.resilience, 'fast_lane_enabled', False):
+                return False
+            body = plan.get('episode_body')
+            if body is None:
+                return False
+            body_bytes = len(body.encode('utf-8'))
+        except (AttributeError, TypeError, UnicodeError):
+            return False
+        return body_bytes <= self.resilience.fast_lane_max_body_bytes
 
     async def _process_with_failover(
         self, row: dict[str, Any], kwargs: dict[str, Any]

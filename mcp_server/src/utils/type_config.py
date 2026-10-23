@@ -78,6 +78,7 @@ def _doc_only_model(name: str, description: str) -> type[BaseModel]:
 
 def build_entity_types(
     entity_type_configs: list[EntityTypeConfig] | None,
+    entity_attributes_doc_only: bool = False,
 ) -> dict[str, type[BaseModel]] | None:
     """Build the ``entity_types`` mapping for ``Graphiti.add_episode``.
 
@@ -85,16 +86,24 @@ def build_entity_types(
     ``ENTITY_TYPES`` (matched by name). Fall back to a documentation-only model
     built from the configured description. Returns ``None`` when no entity types
     are configured, preserving graphiti-core's default extraction behavior.
+
+    When ``entity_attributes_doc_only`` is True (fast-lane project, 2026-10-24),
+    rich models are NOT used: every configured type becomes a documentation-only
+    model with no fields, so per-node attribute extraction LLM calls are skipped
+    engine-wide. The type descriptions still reach the LLM during extraction.
     """
     if not entity_type_configs:
         return None
 
     result: dict[str, type[BaseModel]] = {}
     for cfg in entity_type_configs:
-        registered = ENTITY_TYPES.get(cfg.name)
-        result[cfg.name] = (
-            registered if registered is not None else _doc_only_model(cfg.name, cfg.description)
-        )
+        if entity_attributes_doc_only:
+            result[cfg.name] = _doc_only_model(cfg.name, cfg.description)
+        else:
+            registered = ENTITY_TYPES.get(cfg.name)
+            result[cfg.name] = (
+                registered if registered is not None else _doc_only_model(cfg.name, cfg.description)
+            )
     return result
 
 
