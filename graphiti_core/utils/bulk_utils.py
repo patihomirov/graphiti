@@ -125,6 +125,38 @@ async def retrieve_previous_episodes_bulk(
     return episode_tuples
 
 
+async def _generate_missing_embeddings_bulk(
+    embedder: EmbedderClient,
+    entity_nodes: list[EntityNode],
+    entity_edges: list[EntityEdge],
+) -> None:
+    """Generate every missing node/edge embedding in a single batched call.
+
+    The previous flow embedded one object at a time inside ``add_nodes_and_edges_bulk_tx``,
+    keeping the Neo4j write transaction open for N sequential await round-trips. Here we
+    collect all entity objects whose embedding is still ``None``, send their texts to the
+    embedder as one ``create_batch`` call, and distribute the results back onto the objects.
+    Objects that already carry an embedding are left untouched, and the call is skipped
+    entirely when nothing is missing.
+    """
+    nodes_missing = [node for node in entity_nodes if node.name_embedding is None]
+    edges_missing = [edge for edge in entity_edges if edge.fact_embedding is None]
+
+    if not nodes_missing and not edges_missing:
+        return
+
+    texts = [node.name.replace('\n', ' ') for node in nodes_missing]
+    node_count = len(texts)
+    texts.extend(edge.fact.replace('\n', ' ') for edge in edges_missing)
+
+    embeddings = await embedder.create_batch(texts)
+
+    for node, embedding in zip(nodes_missing, embeddings[:node_count], strict=False):
+        node.name_embedding = embedding
+    for edge, embedding in zip(edges_missing, embeddings[node_count:], strict=False):
+        edge.fact_embedding = embedding
+
+
 async def add_nodes_and_edges_bulk(
     driver: GraphDriver,
     episodic_nodes: list[EpisodicNode],
@@ -133,6 +165,7 @@ async def add_nodes_and_edges_bulk(
     entity_edges: list[EntityEdge],
     embedder: EmbedderClient,
 ):
+    await _generate_missing_embeddings_bulk(embedder, entity_nodes, entity_edges)
     session = driver.session()
     try:
         await session.execute_write(
@@ -165,9 +198,6 @@ async def add_nodes_and_edges_bulk_tx(
     nodes = []
 
     for node in entity_nodes:
-        if node.name_embedding is None:
-            await node.generate_name_embedding(embedder)
-
         entity_data: dict[str, Any] = {
             'uuid': node.uuid,
             'name': node.name,
@@ -190,8 +220,6 @@ async def add_nodes_and_edges_bulk_tx(
 
     edges = []
     for edge in entity_edges:
-        if edge.fact_embedding is None:
-            await edge.generate_embedding(embedder)
         edge_data: dict[str, Any] = {
             'uuid': edge.uuid,
             'source_node_uuid': edge.source_node_uuid,
