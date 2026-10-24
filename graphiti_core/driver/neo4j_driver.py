@@ -68,6 +68,7 @@ class Neo4jDriver(GraphDriver):
         user: str | None,
         password: str | None,
         database: str = 'neo4j',
+        use_vector_index: bool = False,
     ):
         super().__init__()
         self.client = AsyncGraphDatabase.driver(
@@ -75,6 +76,9 @@ class Neo4jDriver(GraphDriver):
             auth=(user or '', password or ''),
         )
         self._database = database
+        # EXPERIMENTAL (feature F5): route node similarity search through the native
+        # Neo4j vector index. See GraphDriver.use_vector_index for details.
+        self.use_vector_index = use_vector_index
 
         # Instantiate Neo4j operations
         self._entity_node_ops = Neo4jEntityNodeOperations()

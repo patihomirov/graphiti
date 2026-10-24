@@ -32,6 +32,7 @@ from graphiti_core.graph_queries import (
     get_nodes_query,
     get_relationships_query,
     get_vector_cosine_func_query,
+    get_vector_index_query,
 )
 from graphiti_core.helpers import (
     lucene_sanitize,
@@ -70,6 +71,14 @@ DEFAULT_MIN_SCORE = 0.6
 DEFAULT_MMR_LAMBDA = 0.5
 MAX_SEARCH_DEPTH = 3
 MAX_QUERY_LENGTH = 128
+
+# EXPERIMENTAL (feature F5): when the vector-index path carries extra predicates
+# (search_filter / group_ids) on top of the pure top-N query, we request more
+# candidates from the index than the final LIMIT, because in-Cypher filters are
+# applied AFTER the index returns its nearest neighbours. Without this headroom the
+# index's top-N could be entirely filtered out and return fewer results than the
+# legacy linear scan would have.
+VECTOR_INDEX_FILTER_K_MULTIPLIER = 10
 
 
 def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> float:
@@ -753,6 +762,56 @@ async def node_similarity_search(
         else:
             return []
     else:
+        # EXPERIMENTAL (feature F5): with driver.use_vector_index=True, route the
+        # node similarity search through the native Neo4j vector index
+        # ('entity_name_embedding') instead of the linear in-Cypher cosine scan of
+        # the whole group. Fail-open: any index/query error logs a warning and falls
+        # back to the legacy linear scan below (never raised to the caller).
+        if driver.provider == GraphProvider.NEO4J and getattr(driver, 'use_vector_index', False):
+            try:
+                # Ask the index for more neighbours than the final LIMIT when extra
+                # predicates (search_filter / group_ids) are applied after YIELD, so
+                # in-Cypher filtering cannot starve the result set.
+                k = limit
+                if filter_queries or group_ids is not None:
+                    k = max(limit * VECTOR_INDEX_FILTER_K_MULTIPLIER, limit)
+                query = (
+                    'CALL '
+                    + get_vector_index_query(
+                        'entity_name_embedding', driver.provider, limit='$k'
+                    )
+                    + ' YIELD node, score\n'
+                    'WITH node AS n, score\n'
+                    + (
+                        f'{filter_query} AND score > $min_score\n'
+                        if filter_query
+                        else 'WHERE score > $min_score\n'
+                    )
+                    + 'RETURN\n'
+                    + get_entity_node_return_query(driver.provider)
+                    + '\nORDER BY score DESC\nLIMIT $limit\n'
+                )
+                records, _, _ = await driver.execute_query(
+                    query,
+                    search_vector=search_vector,
+                    k=k,
+                    limit=limit,
+                    min_score=min_score,
+                    routing_='r',
+                    **filter_params,
+                )
+            except Exception:
+                logger.warning(
+                    'node vector-index search failed (use_vector_index=True), '
+                    'falling back to linear cosine scan',
+                    exc_info=True,
+                )
+            else:
+                nodes = [
+                    get_entity_node_from_record(record, driver.provider) for record in records
+                ]
+                return nodes
+
         query = (
             """
                                                                                                                                     MATCH (n:Entity)
@@ -1141,6 +1200,9 @@ async def community_similarity_search(
         if driver.provider == GraphProvider.KUZU:
             search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
+        # NOTE (experimental feature F5): NOT routed through the vector index. The
+        # live vector index 'entity_name_embedding' only covers (n:Entity), and this
+        # query searches Community nodes, so the legacy linear cosine scan is kept.
         query = (
             """
                                                                                                                                     MATCH (c:Community)
@@ -1331,6 +1393,10 @@ async def get_relevant_nodes(
             """
         )
     else:
+        # NOTE (experimental feature F5): NOT routed through the vector index. This
+        # dedupe-candidate query is a batch (UNWIND $nodes) comparing MANY query
+        # vectors against the whole group and combining with fulltext — a composite
+        # query, not a single top-N vector lookup. The linear cosine scan is kept.
         query = (
             """
                                                                                                                                     UNWIND $nodes AS node

@@ -657,6 +657,10 @@ class DatabaseDriverFactory:
                     'user': username,
                     'password': password,
                     'database': database,
+                    # EXPERIMENTAL (feature F5): native Neo4j vector index for node
+                    # similarity search. Defaults to False when the field is absent
+                    # (backward-compatible with older configs).
+                    'use_vector_index': getattr(neo4j_config, 'use_vector_index', False),
                     # Note: use_parallel_runtime would need to be passed
                     # to the driver after initialization if supported
                 }

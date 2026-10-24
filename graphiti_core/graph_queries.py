@@ -163,6 +163,32 @@ def get_vector_cosine_func_query(vec1, vec2, provider: GraphProvider) -> str:
     return f'vector.similarity.cosine({vec1}, {vec2})'
 
 
+def get_vector_index_query(
+    index_name: str,
+    provider: GraphProvider,
+    limit: str = '$limit',
+    search_vector: str = '$search_vector',
+) -> str:
+    """Build a Neo4j 5 native vector-index query for top-N nodes by one vector.
+
+    EXPERIMENTAL (feature F5): mirrors `node_similarity_search`'s linear cosine scan
+    with `CALL db.index.vector.queryNodes(...)`, which uses the vector index instead
+    of scanning the whole group. Only supported on Neo4j (the index exists on the
+    live graph with name 'entity_name_embedding').
+
+    NOTE (Neo4j 5.26.28): the index itself is created with `vector.similarity_function`
+    (not `vector.similarity`) — that only affects CREATE syntax, the queryNodes call
+    below is unchanged. `limit`/`search_vector` are `$`-bound variables so they can be
+    passed as parameters; results expose `node` and `score` via YIELD.
+    """
+    if provider != GraphProvider.NEO4J:
+        raise NotImplementedError(
+            f'get_vector_index_query is only implemented for Neo4j, got {provider}'
+        )
+
+    return f"db.index.vector.queryNodes('{index_name}', {limit}, {search_vector})"
+
+
 def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> str:
     if provider == GraphProvider.FALKORDB:
         label = NEO4J_TO_FALKORDB_MAPPING[name]

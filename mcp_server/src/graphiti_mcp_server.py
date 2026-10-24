@@ -329,6 +329,7 @@ class GraphitiService:
                         user=db_config['user'],
                         password=db_config['password'],
                         database=db_config['database'],
+                        use_vector_index=db_config.get('use_vector_index', False),
                     )
 
                     self.client = Graphiti(

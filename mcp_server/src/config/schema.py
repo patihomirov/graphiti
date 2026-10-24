@@ -197,6 +197,13 @@ class Neo4jProviderConfig(BaseModel):
     password: str | None = None
     database: str = 'neo4j'
     use_parallel_runtime: bool = False
+    use_vector_index: bool = Field(
+        default=False,
+        description='EXPERIMENTAL (feature F5): route node similarity search through '
+        "the native Neo4j vector index 'entity_name_embedding' instead of the linear "
+        'in-Cypher cosine scan. The index must already exist on the live graph. '
+        'Defaults to False — production behaviour is unchanged.',
+    )
 
 
 class FalkorDBProviderConfig(BaseModel):

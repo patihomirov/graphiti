@@ -94,6 +94,12 @@ class GraphDriver(QueryExecutor, ABC):
     )
     _database: str
     default_group_id: str = ''
+    # EXPERIMENTAL (feature F5): when True, node similarity searches on Neo4j route
+    # through the native `db.index.vector.queryNodes` index instead of the linear
+    # in-Cypher cosine scan. The vector index `entity_name_embedding` must already
+    # exist on the live graph (created with `vector.similarity_function` on Neo4j
+    # 5.26). Defaults to False — prod behaviour is byte-for-byte unchanged.
+    use_vector_index: bool = False
     # Legacy interfaces (kept for backwards compatibility during Phase 1)
     search_interface: SearchInterface | None = None
     graph_operations_interface: GraphOperationsInterface | None = None
