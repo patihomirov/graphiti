@@ -1883,7 +1883,7 @@ class Graphiti:
         """
         search_config = (
             EDGE_HYBRID_SEARCH_RRF if center_node_uuid is None else EDGE_HYBRID_SEARCH_NODE_DISTANCE
-        )
+        ).model_copy()
         search_config.limit = num_results
 
         edges = (
