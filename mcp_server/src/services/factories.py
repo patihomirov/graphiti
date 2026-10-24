@@ -1,12 +1,12 @@
 """Factory classes for creating LLM, Embedder, and Database clients."""
 
-from config.schema import DatabaseConfig, EmbedderConfig, LLMConfig
-
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+
+from config.schema import DatabaseConfig, EmbedderConfig, LLMConfig
 
 # Try to import FalkorDriver if available
 try:
@@ -188,8 +188,10 @@ class LLMClientFactory:
 
                 from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
 
-                # Use the same model for both main and small model slots
-                small_model = config.model
+                # Optional cheap model for ModelSize.small slots (timestamps_batch,
+                # node/edge -operations, ...). None keeps the historical behaviour:
+                # the same model for both main and small model slots.
+                small_model = config.small_model or config.model
 
                 llm_config = CoreLLMConfig(
                     api_key=api_key,
@@ -266,6 +268,7 @@ class LLMClientFactory:
                     api_key=api_key,
                     base_url=base_url,
                     model=config.model,
+                    small_model=config.small_model,
                     # None is intentional for reasoning models; core LLMConfig stores it
                     # verbatim and downstream clients omit temperature when it is None.
                     temperature=config.temperature,  # type: ignore[arg-type]
@@ -297,6 +300,7 @@ class LLMClientFactory:
                 llm_config = GraphitiLLMConfig(
                     api_key=api_key,
                     model=config.model,
+                    small_model=config.small_model,
                     # None is intentional for reasoning models; core LLMConfig stores it
                     # verbatim and downstream clients omit temperature when it is None.
                     temperature=config.temperature,  # type: ignore[arg-type]
@@ -316,6 +320,7 @@ class LLMClientFactory:
                 llm_config = GraphitiLLMConfig(
                     api_key=api_key,
                     model=config.model,
+                    small_model=config.small_model,
                     # None is intentional for reasoning models; core LLMConfig stores it
                     # verbatim and downstream clients omit temperature when it is None.
                     temperature=config.temperature,  # type: ignore[arg-type]
@@ -336,6 +341,7 @@ class LLMClientFactory:
                     api_key=api_key,
                     base_url=config.providers.groq.api_url,
                     model=config.model,
+                    small_model=config.small_model,
                     # None is intentional for reasoning models; core LLMConfig stores it
                     # verbatim and downstream clients omit temperature when it is None.
                     temperature=config.temperature,  # type: ignore[arg-type]

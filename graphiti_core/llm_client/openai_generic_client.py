@@ -120,6 +120,21 @@ class OpenAIGenericClient(LLMClient):
         else:
             self.client = client
 
+    def _resolve_wire_model(self, model_size: ModelSize) -> str:
+        """The model sent on the wire for a call of ``model_size``.
+
+        The per-task failover override (pinned by the journal worker for the
+        duration of an episode) always wins so an episode stays on one model.
+        Otherwise ``ModelSize.small`` calls (timestamps_batch etc.) use the
+        optionally-configured cheap ``small_model``; None (the default) keeps
+        the historical single-model behaviour — every slot on the main model.
+        """
+        if self.model_override:
+            return self.model_override
+        if model_size == ModelSize.small and self.small_model:
+            return self.small_model
+        return self.model or DEFAULT_MODEL
+
     def _build_response_format(self, response_model: type[BaseModel] | None) -> dict[str, Any]:
         """Build the ``response_format`` payload for the chat completion request.
 
@@ -172,9 +187,10 @@ class OpenAIGenericClient(LLMClient):
                 openai_messages.append({'role': 'user', 'content': m.content})
             elif m.role == 'system':
                 openai_messages.append({'role': 'system', 'content': m.content})
+        model = self._resolve_wire_model(model_size)
         try:
             response = await self.client.chat.completions.create(
-                model=self.model_override or self.model or DEFAULT_MODEL,
+                model=model,
                 messages=openai_messages,
                 temperature=self.temperature,
                 max_tokens=max_tokens,
@@ -186,7 +202,7 @@ class OpenAIGenericClient(LLMClient):
             reasoning_content = getattr(choice.message, 'reasoning_content', None)
             reasoning_len = len(reasoning_content) if reasoning_content else 0
             usage_summary = _usage_summary(getattr(response, 'usage', None))
-            model_used = self.model_override or self.model or DEFAULT_MODEL
+            model_used = model
             # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
             # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
             if not result:

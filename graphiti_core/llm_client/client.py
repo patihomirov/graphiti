@@ -197,7 +197,7 @@ class LLMClient(ABC):
         """
         self.channel_rate_limiter = limiter
 
-    def channel_key(self) -> str:
+    def channel_key(self, model_size: ModelSize | None = None) -> str:
         """The (provider, model) channel key used by the rate limiter.
 
         ``provider`` is the configured base_url (same provider = same quota),
@@ -206,16 +206,35 @@ class LLMClient(ABC):
         the journal worker's failover-gate key (see queue_service
         ``_channel_for_candidate``) so a saturated channel is detected before
         an episode starts on it.
+
+        ``model_size`` lets size-aware clients (e.g. the OpenAI-compatible
+        generic client) pace under the wire model of a specific slot: a cheap
+        ``small_model`` then forms its own channel. None (the default) keeps
+        the legacy key (override or main model).
         """
         base = (
             getattr(self.config, 'base_url', None)
             or self._get_provider_type()
             or 'unknown'
         )
-        model = self.model_override or self.model or ''
+        if model_size is not None:
+            model = self._resolve_wire_model(model_size)
+        else:
+            model = self.model_override or self.model or ''
         return f'{base}|{model}'
 
-    async def _channel_pace(self) -> None:
+    def _resolve_wire_model(self, model_size: ModelSize) -> str:
+        """The model sent on the wire for a call of ``model_size``.
+
+        The per-task failover override (pinned by the journal worker for the
+        duration of an episode) always wins; otherwise the configured model is
+        returned. Size-aware clients that route ``ModelSize.small`` to a cheap
+        ``small_model`` (e.g. the OpenAI-compatible generic client) override
+        this so pacing and logging follow the actual wire model.
+        """
+        return self.model_override or self.model or ''
+
+    async def _channel_pace(self, model_size: ModelSize = ModelSize.medium) -> None:
         """Wait for a free slot on this channel's rate limiter, if one is set.
 
         No-op when no limiter is attached or its limit is 0 (OFF). The wait is
@@ -227,7 +246,7 @@ class LLMClient(ABC):
             return
         if not getattr(limiter, 'enabled', False):
             return
-        await limiter.acquire(self.channel_key())
+        await limiter.acquire(self.channel_key(model_size=model_size))
 
     def set_tracer(self, tracer: Tracer) -> None:
         """Set the tracer for this LLM client."""
@@ -278,7 +297,7 @@ class LLMClient(ABC):
             # (provider, model) channel before EVERY wire call (each tenacity
             # retry re-passes through it, keeping the stream to the configured
             # ceiling even under a failure storm).
-            await self._channel_pace()
+            await self._channel_pace(model_size=model_size)
             return await self._generate_response(messages, response_model, max_tokens, model_size)
         except (httpx.HTTPStatusError, RateLimitError) as e:
             raise e

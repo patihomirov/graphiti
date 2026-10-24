@@ -15,6 +15,7 @@ llm:
   # реальном теле (20.10: 80 сущ./90 связей, empty=0, 4.8с); его 429 были пакетными (3 воркера +
   # failover), одиночный темп (journal_workers=1) их убирает — как и на default.
   model: "AgentLLM-big"
+  # small_model: "AgentLLM-small"  # дешёвая модель для small-слотов (timestamps_batch); None = основная модель
   max_tokens: 32768
 
   providers:
