@@ -20,6 +20,11 @@ storm:
   model that simply went quiet self-recovers without waiting for a new call),
   followed by a successful call on it — one quiet success clears the storm
   immediately (the requirement's probe-like exit).
+- EXIT storm (silence self-release): ''in_storm'' also flips back to false on
+  its own once a full detection window (``storm_detection_429_window_seconds``)
+  passes with no new 429 — or with total silence — even if no successful call
+  lands. A model whose 429 wave is over must not stay stuck in storm while
+  producers pause on the Retry-After hint (429 wave gone == not a storm).
 
 No LLM, no graph DB, no network. All state is in-memory and thread-safe.
 """
@@ -45,6 +50,7 @@ class _ModelStormState:
     storm_started_ts: float | None = None
     last_429_ts: float | None = None
     last_success_ts: float | None = None
+    last_event_ts: float | None = None
     retry_after_until: float | None = None
 
 
@@ -91,6 +97,31 @@ class StormThrottle:
             stats.storm_started_ts = None
             stats.retry_after_until = None
 
+    def _maybe_exit_storm_locked(
+        self, stats: _ModelStormState, now: float
+    ) -> None:
+        """Silence self-release: drop a storm once its 429 wave is clearly over.
+
+        Two exhaustion conditions, both relative to the detection window:
+        1. no new 429 for a full ``self._window`` — the wave ended even if
+           successes keep landing;
+        2. total silence (no 429 and no success) for a full window.
+        Either means "not a storm anymore" — no successful call is required to
+        clear it (avoids the 429-pause -> no-success -> stuck loop). Hysteresis
+        is preserved: 429s closer than the window always hold ``in_storm``.
+        """
+        if not stats.in_storm:
+            return
+        if stats.last_429_ts is not None and (
+            now - stats.last_429_ts >= self._window
+        ):
+            self._exit_locked(stats)
+            return
+        if stats.last_event_ts is not None and (
+            now - stats.last_event_ts >= self._window
+        ):
+            self._exit_locked(stats)
+
     def record_failure(
         self,
         model: str,
@@ -101,8 +132,10 @@ class StormThrottle:
         now = self._time_fn()
         with self._lock:
             stats = self._stats_locked(model, now)
+            self._maybe_exit_storm_locked(stats, now)
             stats._429.append(now)
             stats.last_429_ts = now
+            stats.last_event_ts = now
             if (
                 self._respect_retry_after
                 and isinstance(retry_after, (int, float))
@@ -121,7 +154,9 @@ class StormThrottle:
             stats = self._models.setdefault(
                 model, _ModelStormState(window=self._window)
             )
+            self._maybe_exit_storm_locked(stats, now)
             stats.last_success_ts = now
+            stats.last_event_ts = now
             if stats.in_storm:
                 quiet = stats.last_429_ts is None or (
                     now - stats.last_429_ts >= self._exit_silence
@@ -134,10 +169,14 @@ class StormThrottle:
         now = self._time_fn()
         with self._lock:
             stats = self._models.get(model)
-            if stats is None or not stats.in_storm:
+            if stats is None:
+                return False
+            self._maybe_exit_storm_locked(stats, now)
+            if not stats.in_storm:
                 return False
             # Lazy self-heal: a storm that has been quiet longer than the exit
-            # window is over even before the next call lands a success on it.
+            # window is over even before the next call lands a success on it
+            # (covers the case where ``window_seconds`` > ``exit_silence``).
             if stats.last_429_ts is not None and (
                 now - stats.last_429_ts >= self._exit_silence
             ):
@@ -155,9 +194,11 @@ class StormThrottle:
         now = self._time_fn()
         with self._lock:
             stats = self._models.get(model)
+            if stats is None:
+                return None
+            self._maybe_exit_storm_locked(stats, now)
             if (
-                stats is None
-                or not stats.in_storm
+                not stats.in_storm
                 or not self._respect_retry_after
                 or stats.retry_after_until is None
             ):
@@ -195,6 +236,7 @@ class StormThrottle:
                 if stats is None:
                     continue
                 self._stats_locked(model, now)
+                self._maybe_exit_storm_locked(stats, now)
                 in_storm = bool(stats.in_storm)
                 throttled: float | None = None
                 if (
@@ -219,6 +261,7 @@ class StormThrottle:
                     'window_seconds': round(self._window, 1),
                     'last_429_ts': stats.last_429_ts,
                     'last_success_ts': stats.last_success_ts,
+                    'last_event_ts': stats.last_event_ts,
                     'storm_started_ts': stats.storm_started_ts if in_storm else None,
                 }
         return {'per_model': out}

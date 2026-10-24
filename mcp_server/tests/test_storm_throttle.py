@@ -138,6 +138,81 @@ class TestStormExit:
         assert t.in_storm('model-A') is True
 
 
+class TestStormSilenceSelfRelease:
+    """The silence self-release: a storm clears once its 429 wave is over.
+
+    Regression for the stuck flag: when a 429 wave ends and the producer pauses
+    on the Retry-After hint (so no successful call ever lands), ``in_storm``
+    must flip back to false on its own once a full detection window passes
+    without new 429s (or with total silence).
+    """
+
+    def _storm_a(self, t: StormThrottle, clock: StormClock, threshold: int = 3):
+        for _ in range(threshold):
+            t.record_failure('model-A')
+        assert t.in_storm('model-A') is True
+        return t
+
+    @pytest.mark.unit
+    def test_storm_releases_after_window_without_new_429s(self):
+        """(a) 429s stop; no success ever lands; >window later -> released."""
+        clock = StormClock()
+        t = make_throttle(clock, threshold=3)  # window_seconds=60
+        self._storm_a(t, clock)
+        # Still storming just inside the window.
+        clock.advance(59.0)
+        assert t.in_storm('model-A') is True
+        # A full window of silence (no 429, no success) clears it lazily.
+        clock.advance(2.0)  # 61s since the last 429
+        assert t.in_storm('model-A') is False
+        assert t.is_throttled('model-A') is None
+        assert t.storm_models() == []
+        assert t.any_storm() is False
+        snap = t.snapshot()
+        assert snap['per_model']['model-A']['in_storm'] is False
+
+    @pytest.mark.unit
+    def test_storm_releases_on_success_when_429s_have_stopped(self):
+        """Successes keep landing but no 429 for a full window -> released."""
+        clock = StormClock()
+        t = make_throttle(clock, threshold=3)
+        self._storm_a(t, clock)
+        # A success 40s after the last 429: still noisy (< window), holds.
+        clock.advance(40.0)
+        t.record_success('model-A')
+        assert t.in_storm('model-A') is True
+        # Another success 25s later: 65s since the last 429 -> cleared on entry.
+        clock.advance(25.0)
+        t.record_success('model-A')
+        assert t.in_storm('model-A') is False
+
+    @pytest.mark.unit
+    def test_storm_releases_in_snapshot_after_silence(self):
+        """/health stops reporting the storm after a silent window."""
+        clock = StormClock()
+        t = make_throttle(clock, threshold=3)
+        self._storm_a(t, clock)
+        clock.advance(61.0)
+        assert t.snapshot()['per_model']['model-A']['in_storm'] is False
+
+    @pytest.mark.unit
+    def test_storm_holds_while_429s_keep_coming(self):
+        """(b) 429s every <window keep the storm — no premature release."""
+        clock = StormClock()
+        t = make_throttle(clock, threshold=3)
+        self._storm_a(t, clock)
+        # 429s keep coming every 30s for a long time: storm must persist.
+        for _ in range(20):
+            clock.advance(30.0)
+            t.record_failure('model-A')
+            assert t.in_storm('model-A') is True
+        # Even after a fresh 429 lands just under the window, still storming.
+        clock.advance(30.0)
+        t.record_failure('model-A')
+        assert t.in_storm('model-A') is True
+        assert t.snapshot()['per_model']['model-A']['in_storm'] is True
+
+
 class TestRetryAfterThrottling:
     @pytest.mark.unit
     def test_throttled_returns_remaining_retry_after(self):
