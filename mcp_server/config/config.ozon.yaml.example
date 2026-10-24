@@ -20,7 +20,7 @@ llm:
 
   providers:
     openai:
-      api_key: {file:${HOME}/.o3_llm_token}   # REPLACE with your key or {file:...} path
+      api_key: "{file:${HOME}/.o3_llm_token}"   # REPLACE with your key or {file:...} path
       api_url: "https://llm-gateway-proton.t.o3.ru/v1"
 
     # Feature B: zai overflow channel (Z.AI via local o3-plugin-agent proxy).
@@ -49,6 +49,11 @@ database:
       username: "neo4j"
       password: "password"
       database: "neo4j"
+      # EXPERIMENTAL (feature F5): route node similarity search through the
+      # native Neo4j vector index 'entity_name_embedding' (ONLY after the
+      # refresh-policy rebuild has verified it). Default False = legacy linear
+      # in-Cypher cosine scan (exact, ~100x slower). See scripts/rebuild_vector_index.py.
+      use_vector_index: false
 
 graphiti:
   group_id: "main"

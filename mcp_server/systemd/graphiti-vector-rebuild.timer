@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic rebuild of the Graphiti entity_name_embedding vector index (every 6h)
+Documentation=https://github.com/ozon/graphiti-mcp
+
+[Timer]
+# Сразу после загрузки — и далее раз в 6 часов от последнего срабатывания.
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+# Не параллелить с ночными задачами хоста — необязательный компромисс.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

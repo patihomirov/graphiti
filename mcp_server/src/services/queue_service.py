@@ -2310,6 +2310,16 @@ class QueueService:
             snapshot['pending_episodes'] = self._spool.count_pending() if self._spool is not None else 0
             snapshot['journal'] = {'enabled': False, 'search': False}
         snapshot['stopping'] = self._stopping
+        # Feature B: refresh the sampled backlog cache on each /health snapshot.
+        # After a drain with no new episodes, _zai_overflow_allowed is no longer
+        # called, so the cache would otherwise keep the last sampled value (e.g.
+        # backlog_unfinished=1 while the journal is actually empty). One indexed
+        # COUNT per health check is cheap.
+        if self._journal is not None:
+            try:
+                self._zai_backlog_unfinished = await self._journal.count_unfinished()
+            except Exception:
+                logger.exception('failed to refresh zai backlog on health snapshot')
         # Feature A: per-model storm block for /health -> storm.per_model
         # (which models are storming, their hard Retry-After remaining).
         snapshot['storm'] = self._storm.snapshot()

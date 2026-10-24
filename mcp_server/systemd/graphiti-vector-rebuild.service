@@ -1,0 +1,15 @@
+[Unit]
+Description=Graphiti vector index refresh (rebuild entity_name_embedding)
+Documentation=https://github.com/ozon/graphiti-mcp
+After=docker.service graphiti-mcp.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/Ptikhomirovan/graphiti/mcp_server/scripts/run-rebuild-vector-index.sh
+Environment="HOME=/home/Ptikhomirovan"
+# DROP+CREATE+populate+self-check 100 нод может занять минуты
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

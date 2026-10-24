@@ -714,6 +714,22 @@ class TestHealthZaiBlock:
         finally:
             await service.close()
 
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_snapshot_refreshes_stale_backlog_cache(self, tmp_path):
+        # After a drain with no new episodes, _zai_overflow_allowed is no longer
+        # called, so the cache would keep the last sampled value. /health must
+        # report the LIVE backlog, not the stale snapshot.
+        service = QueueService(
+            make_config(tmp_path / 'h3.db', zai_overflow_pending_threshold=120)
+        )
+        try:
+            service._zai_backlog_unfinished = 7  # stale leftover from the drain
+            snap = await service.get_resilience_snapshot()
+            assert snap['zai']['backlog_unfinished'] == 0  # live count, cache refreshed
+        finally:
+            await service.close()
+
 
 class TestGatedOverflow:
     """Backlog gate keeps the zai channel a strict overflow (drain) channel.
