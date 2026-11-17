@@ -430,7 +430,7 @@ class TestEpisodeDeadline:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_overdue_attempted_row_fails_at_claim(self, tmp_path):
-        """A created-6h-ago row that already attempted is surrendered at claim."""
+        """A created-6h-ago row that failed twice is surrendered at claim."""
         service = QueueService(
             make_config(
                 tmp_path / 'ddl.db',
@@ -444,8 +444,10 @@ class TestEpisodeDeadline:
             old_created = (
                 datetime.now(timezone.utc) - timedelta(hours=7)
             ).isoformat()
+            # attempt=2: the default episode_wall_deadline_min_attempts, i.e. the
+            # row already had two recorded failures - a real chance to succeed.
             await j._execute(
-                'UPDATE episode_queue SET created_at=?, attempt=1 WHERE id=?',
+                'UPDATE episode_queue SET created_at=?, attempt=2 WHERE id=?',
                 (old_created, row_id),
             )
             processed = await service._process_journal_once('g1', worker_id=service._worker_id)
@@ -516,13 +518,13 @@ class TestEpisodeDeadline:
         )
         try:
             j = service.journal
-            # Stale head row: created 7 days ago, already attempted -> deadline.
+            # Stale head row: created 7 days ago, two recorded failures -> deadline.
             stale_id, _ = await j.enqueue(make_plan(uuid='u-stale-head'))
             old_created = (
                 datetime.now(timezone.utc) - timedelta(days=7)
             ).isoformat()
             await j._execute(
-                'UPDATE episode_queue SET created_at=?, attempt=1 WHERE id=?',
+                'UPDATE episode_queue SET created_at=?, attempt=2 WHERE id=?',
                 (old_created, stale_id),
             )
             # Live row behind it: fresh, never attempted -> must be processed.

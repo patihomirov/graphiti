@@ -463,6 +463,27 @@ class GraphitiService:
         return self.client
 
 
+def _effective_queue_max_depth(snapshot: dict[str, Any]) -> int:
+    """Queue ceiling that matches the active intake path.
+
+    On the journal path rows live on disk, so the intake ceiling is
+    ``resilience.journal_max_pending`` (published in the snapshot's journal block)
+    and not the RAM-protecting legacy ``max_queue_depth`` (20) that only bounds
+    the in-memory queue. Reporting the legacy number next to a journal
+    ``queue_depth`` makes any consumer of /health see a permanent overflow while
+    the journal is well inside its own ceiling.
+    """
+    journal = snapshot.get('journal') or {}
+    if journal.get('enabled'):
+        ceiling = journal.get('max_pending')
+        if isinstance(ceiling, int) and ceiling > 0:
+            return ceiling
+    legacy = snapshot.get('max_queue_depth')
+    if isinstance(legacy, int) and legacy > 0:
+        return legacy
+    return 20
+
+
 async def _backpressure_error_response(exc: Exception) -> ErrorResponse:
     """Build a machine-readable ErrorResponse for a fail-fast backpressure rejection."""
     snapshot: dict[str, Any] = {}
@@ -473,7 +494,7 @@ async def _backpressure_error_response(exc: Exception) -> ErrorResponse:
             snapshot = {}
     state = snapshot.get('state', getattr(exc, 'state', 'unknown'))
     depth = snapshot.get('queue_depth', '?')
-    max_depth = snapshot.get('max_queue_depth', 20)
+    max_depth = _effective_queue_max_depth(snapshot)
     retry_after = snapshot.get('retry_after_seconds') or config.resilience.open_timeout_seconds
     stopping = snapshot.get('stopping', False)
     message = (
@@ -1641,7 +1662,10 @@ async def health_check(request) -> JSONResponse:
             snapshot = {'state': 'error', 'detail': str(e)}
         body['circuit_breaker'] = snapshot.get('state', 'unknown')
         body['queue_depth'] = snapshot.get('queue_depth', 0)
-        body['max_queue_depth'] = snapshot.get('max_queue_depth', 20)
+        # Ceiling that belongs to the active intake path (journal_max_pending while
+        # the durable journal is on, the legacy in-memory max_queue_depth otherwise)
+        # so queue_depth/max_queue_depth is a comparable pair for consumers.
+        body['max_queue_depth'] = _effective_queue_max_depth(snapshot)
         body['pending_episodes'] = snapshot.get('pending_episodes', 0)
         body['retry_after_seconds'] = snapshot.get('retry_after_seconds', 0)
         body['journal'] = snapshot.get('journal', {'enabled': False})

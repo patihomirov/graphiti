@@ -497,13 +497,25 @@ class CircuitBreaker:
             return True
 
     async def record_success(self) -> None:
-        """Record a successful probe / request. Only closes from half_open."""
+        """Record a successful probe / request.
+
+        A success in the ``open`` state also closes the breaker: the journal
+        worker pool drains rows without consulting ``allow_request()`` (it would
+        otherwise reject its own backlog), so its successes are the only evidence
+        of recovery the breaker can get - and without closing here an open
+        breaker would never leave that state again, reporting a permanently
+        degraded service while episodes are actually completing.
+        """
         async with self._lock:
             if self._state == 'half_open':
                 self._state = 'closed'
                 self._probe_in_flight = False
                 self._reset()
                 logger.info('Circuit breaker closed after successful probe')
+            elif self._state == 'open':
+                self._state = 'closed'
+                self._reset()
+                logger.info('Circuit breaker closed after a successful request while open')
             elif self._state == 'closed':
                 # A clean success in the closed state resets any partial runs so a
                 # single old failure does not linger, but we keep the counter at 0

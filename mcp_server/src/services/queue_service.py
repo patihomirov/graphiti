@@ -197,6 +197,12 @@ class QueueService:
         self._episode_wall_deadline_seconds = float(
             getattr(self.resilience, 'episode_wall_deadline_seconds', 21600.0) or 0.0
         )
+        # Minimum recorded failures before the wall-clock deadline may surrender a
+        # row: a single attempt that died on transport is not a real processing
+        # attempt, so the deadline only applies from the second failure on.
+        self._episode_wall_deadline_min_attempts = max(
+            1, int(getattr(self.resilience, 'episode_wall_deadline_min_attempts', 2) or 2)
+        )
 
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
@@ -569,11 +575,12 @@ class QueueService:
         if row is None:
             return False
 
-        # RCA C3 wall-clock deadline: an episode that has already started
-        # processing (attempt >= 1) and exceeded its deadline is surrendered to
-        # failed right at claim time, so a row that has been oscillating for
-        # hours cannot even be re-processed. Never-attempted backlog rows are
-        # exempt (they are not poison, just waiting in FIFO).
+        # RCA C3 wall-clock deadline: an episode that really ran out of chances
+        # (attempt >= episode_wall_deadline_min_attempts) and exceeded its
+        # deadline is surrendered to failed right at claim time, so a row that has
+        # been oscillating for hours cannot even be re-processed. Rows without a
+        # single genuine attempt are exempt: never-attempted FIFO backlog is not
+        # poison, and one transport failure during an outage proves nothing.
         deadline_error = self._deadline_error(row)
         if self._deadline_exceeded(row):
             await self._journal.mark_failed(
@@ -665,18 +672,24 @@ class QueueService:
     def _deadline_exceeded(self, row: dict[str, Any]) -> bool:
         """Whether a claimed row has blown its wall-clock deadline (RCA C3).
 
-        Only rows that have ALREADY started processing (``attempt >= 1``) are
-        subject: a never-attempted row sitting in the FIFO backlog is legitimate
-        debt, not a stuck/poison episode, and must not be killed on arrival.
+        Only rows that already ran out of real chances
+        (``attempt >= episode_wall_deadline_min_attempts``) are subject: a
+        never-attempted row sitting in the FIFO backlog is legitimate debt, and a
+        row with a single recorded failure (transport blip during an outage) has
+        not yet had a genuine attempt - neither is a stuck/poison episode and
+        neither may be killed on arrival.
         """
+        return self._wall_deadline_exceeded(
+            int(row.get('attempt') or 0), row.get('created_at')
+        )
+
+    def _wall_deadline_exceeded(self, attempt: int, created_at: str | None) -> bool:
+        """Shared wall-clock deadline gate for the claim path and the watchdog."""
         if self._episode_wall_deadline_seconds <= 0:
             return False
-        if (row.get('attempt') or 0) < 1:
+        if attempt < self._episode_wall_deadline_min_attempts:
             return False
-        created_at = row.get('created_at')
-        if not created_at:
-            return False
-        created = _parse_iso_or_none(created_at)
+        created = _parse_iso_or_none(created_at) if created_at else None
         if created is None:
             return False
         age = datetime.now(timezone.utc) - created
@@ -1690,31 +1703,27 @@ class QueueService:
                         self._notify_pool()
                         return
                 # Deadline check next (does not depend on a stale lease).
-                if (
-                    self._episode_wall_deadline_seconds > 0
-                    and attempt >= 1
-                    and created_at
+                created = _parse_iso_or_none(created_at) if created_at else None
+                if created is not None and self._wall_deadline_exceeded(
+                    attempt, created_at
                 ):
-                    created = _parse_iso_or_none(created_at)
-                    if created is not None:
-                        age = datetime.now(timezone.utc) - created
-                        if age.total_seconds() > self._episode_wall_deadline_seconds:
-                            failed = await self._journal.mark_failed(
-                                row_id,
-                                (
-                                    f'deadline exceeded {age} wall-clock '
-                                    f'(RCA C3 watchdog)'
-                                ),
-                                worker_id=worker_id,
-                            )
-                            if failed:
-                                logger.warning(
-                                    'watchdog: surrendered own row %s to failed '
-                                    '(wall-clock deadline exceeded)',
-                                    row_id,
-                                )
-                                self._notify_pool()
-                                return
+                    age = datetime.now(timezone.utc) - created
+                    failed = await self._journal.mark_failed(
+                        row_id,
+                        (
+                            f'deadline exceeded {age} wall-clock '
+                            f'(RCA C3 watchdog)'
+                        ),
+                        worker_id=worker_id,
+                    )
+                    if failed:
+                        logger.warning(
+                            'watchdog: surrendered own row %s to failed '
+                            '(wall-clock deadline exceeded)',
+                            row_id,
+                        )
+                        self._notify_pool()
+                        return
                 healed = await self._journal.requeue_own_stale(
                     row_id, worker_id, grace
                 )

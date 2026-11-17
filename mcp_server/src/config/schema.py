@@ -369,12 +369,24 @@ class ResilienceConfig(BaseModel):
         default=21600.0,
         ge=0.0,
         description='RCA C3 wall-clock deadline per episode: an episode that has '
-        'already started processing (attempt >= 1) and whose ``created_at`` is older '
-        'than this is surrendered to ``failed`` ("deadline exceeded") at claim time '
-        'and by the per-row watchdog - a hard finite guarantee regardless of attempt '
-        'count. 0 disables the deadline. Rows that never attempted (attempt=0, e.g. '
-        'the deep FIFO backlog) are NOT subject, so legitimate backlog is not killed '
-        'on arrival.',
+        'genuinely attempted processing (attempt >= ``episode_wall_deadline_min_attempts``) '
+        'and whose ``created_at`` is older than this is surrendered to ``failed`` '
+        '("deadline exceeded") at claim time and by the per-row watchdog - a hard '
+        'finite guarantee regardless of attempt count. 0 disables the deadline. Rows '
+        'that never attempted (attempt=0, e.g. the deep FIFO backlog) and rows with a '
+        'single recorded failure (a transport blip during an outage is not evidence of '
+        'a poison episode) are NOT subject, so legitimate backlog is not killed on '
+        'arrival.',
+    )
+    episode_wall_deadline_min_attempts: int = Field(
+        default=2,
+        ge=1,
+        description='RCA C3: how many recorded failures a row must have before the '
+        'wall-clock deadline may surrender it. One attempt that died on transport '
+        '(llm-gateway outage, DNS storm) is not a real chance at processing, so the '
+        'deadline starts applying from the second failure on. Raise it to give flapping '
+        'backends more slack; lower it to 1 for the pre-existing "attempt >= 1" '
+        'behaviour.',
     )
     journal_enabled: bool = Field(
         default=False,
